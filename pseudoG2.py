@@ -374,6 +374,125 @@ def visualize_stim_epoch_with_sliding_window(
     plt.show()
 
 
+# --- 6. Template Matching for Stim Pulse Identification (inspired by old.py) ---
+def identify_stim_pulses_template_matching(
+    avg_signal,
+    sfreq,
+    stim_freq_hz,
+    template_window_ms=5,
+    num_pulses_for_template=10,
+    initial_peak_prominence_factor=3.0, # Multiplier for std dev for initial threshold
+    initial_peak_dist_factor=0.8, # Factor of stim period for min_dist
+    mf_peak_percentile=80,
+    mf_peak_dist_factor=0.5 # Factor of stim period for distance
+):
+    """
+    Identifies stimulation pulses using template matching.
+
+    Args:
+        avg_signal (np.ndarray): Average signal across channels (1D).
+        sfreq (float): Sampling frequency in Hz.
+        stim_freq_hz (float): Estimated stimulation frequency in Hz.
+        template_window_ms (int): Half-width of the window for creating template snippets, in ms.
+        num_pulses_for_template (int): Number of initial pulses to average for template.
+        initial_peak_prominence_factor (float): Factor to multiply std dev by for initial peak threshold.
+        initial_peak_dist_factor (float): Factor of stimulation period for minimum distance between initial peaks.
+        mf_peak_percentile (int): Percentile for matched-filter output peak detection threshold.
+        mf_peak_dist_factor (float): Factor of stimulation period for minimum distance between matched-filter peaks.
+
+    Returns:
+        tuple: (pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output)
+               Returns (None, None, None, None) if steps fail.
+    """
+    print(f"\n--- Identifying stimulation pulses using template matching (stim_freq: {stim_freq_hz:.2f} Hz) ---")
+
+    # 1. Initial rough detection of artifact starts
+    print("Step 1: Initial rough pulse detection...")
+    thresh_init = np.mean(np.abs(avg_signal)) + initial_peak_prominence_factor * np.std(np.abs(avg_signal))
+    min_dist_samples = int(initial_peak_dist_factor * (sfreq / stim_freq_hz))
+    
+    initial_peaks_indices, _ = find_peaks(np.abs(avg_signal), height=thresh_init, distance=min_dist_samples)
+    
+    if len(initial_peaks_indices) == 0:
+        print("No initial pulses found. Cannot proceed with template matching.")
+        return None, None, None, None
+    print(f"Found {len(initial_peaks_indices)} initial candidate pulses.")
+
+    # 2. Build the template
+    print(f"Step 2: Building template from first {min(num_pulses_for_template, len(initial_peaks_indices))} pulses...")
+    template_window_samples = int(template_window_ms * sfreq / 1000)
+    snippets = []
+    for idx in initial_peaks_indices[:num_pulses_for_template]:
+        start = max(0, idx - template_window_samples)
+        end = min(len(avg_signal), idx + template_window_samples)
+        snippet = avg_signal[start:end]
+        # Pad/truncate to uniform length (2*template_window_samples)
+        required_len = 2 * template_window_samples
+        if len(snippet) < required_len:
+            padding = required_len - len(snippet)
+            # Smart padding: if snippet is from beginning, pad at end; if from end, pad at start
+            if start == 0: # Snippet was truncated at the beginning
+                 snippet = np.pad(snippet, (0, padding), mode='constant', constant_values=0)
+            else: # Snippet was truncated at the end or is shorter for other reasons
+                 snippet = np.pad(snippet, (0, padding), mode='constant', constant_values=0)
+        elif len(snippet) > required_len:
+            snippet = snippet[:required_len] # Should not happen if idx is centered
+        
+        if len(snippet) == required_len: # Ensure snippet is correct length before appending
+            snippets.append(snippet)
+        else:
+            print(f"Warning: Snippet for index {idx} has unexpected length {len(snippet)}, expected {required_len}. Skipping.")
+
+
+    if not snippets:
+        print("No valid snippets collected for template creation.")
+        return None, None, None, None
+        
+    template_waveform = np.mean(snippets, axis=0)
+    if np.all(template_waveform == 0):
+        print("Warning: Template is all zeros. Check initial pulse detection or signal quality.")
+        # return None, None, None, None # Or allow to proceed if this is expected in some cases
+
+    # 3. Matched filter: convolve with time-reversed template
+    print("Step 3: Applying matched filter...")
+    mf_kernel = template_waveform[::-1]
+    matched_filter_output = np.convolve(avg_signal, mf_kernel, mode='same')
+
+    # 4. Detect peaks in matched-filter output
+    print("Step 4: Detecting peaks in matched-filter output...")
+    stim_period_samples = sfreq / stim_freq_hz
+    mf_peak_threshold = np.percentile(matched_filter_output, mf_peak_percentile)
+    mf_distance_samples = int(mf_peak_dist_factor * stim_period_samples)
+    
+    pulse_starts_samples, _ = find_peaks(
+        matched_filter_output,
+        height=mf_peak_threshold,
+        distance=mf_distance_samples
+    )
+
+    if len(pulse_starts_samples) == 0:
+        print("No pulses found after matched filtering.")
+        return pulse_starts_samples, None, template_waveform, matched_filter_output # Return empty starts and template
+
+    # Define pulse ends based on template length
+    template_half_len = len(template_waveform) // 2
+    pulse_ends_samples = [min(len(avg_signal) - 1, start + template_half_len) for start in pulse_starts_samples]
+    # Adjust pulse_starts based on template alignment (assuming peak of template is center)
+    # The convolve 'same' output aligns center of kernel with point.
+    # find_peaks gives the peak of the mf_output. If template is symmetric and centered, this is fine.
+    # For now, let's assume pulse_starts_samples are the "true" starts relative to template shape.
+    # Or, adjust starts to be beginning of template window:
+    pulse_starts_samples = [max(0, s - template_half_len) for s in pulse_starts_samples]
+    # Recalculate ends to maintain template duration
+    pulse_ends_samples = [min(len(avg_signal) - 1, s + len(template_waveform) -1) for s in pulse_starts_samples]
+
+
+    print(f"Identified {len(pulse_starts_samples)} stimulation pulses via template matching.")
+    return pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output
+
+
+
+
 # --- Main Execution Block ---
 if __name__ == '__main__':
     try:
@@ -381,6 +500,7 @@ if __name__ == '__main__':
         #all the  psds are already calculated 
         
         mean_psd = psds.mean(axis=0)
+        avg_signal_full = np.mean(data, axis=0) # Calculate average signal for template matching
         
         #this is meant for a 1d array!!!
         estStimFrequency = find_prominent_peaks(
@@ -392,13 +512,66 @@ if __name__ == '__main__':
 
 
         # Plot the mean PSD
-        plt.plot(freqs, mean_psd, label='Mean PSD')
-        plt.xlabel('Frequency (Hz)')
-        plt.ylabel('Power Spectral Density (V^2/Hz)')
-        plt.title('Mean PSD Across All Channels')
-        plt.legend()
+        fig_psd, ax_psd = plt.subplots(figsize=(10, 6))
+        ax_psd.plot(freqs, mean_psd, label='Mean PSD')
+        ax_psd.set_xlabel('Frequency (Hz)')
+        ax_psd.set_ylabel('Power Spectral Density (V^2/Hz)')
+        ax_psd.set_title('Mean PSD Across All Channels')
+        if estStimFrequency is not None:
+            ax_psd.axvline(estStimFrequency, color='r', linestyle='--', label=f'Est. Stim Freq: {estStimFrequency:.2f} Hz')
+        ax_psd.legend()
+        ax_psd.grid(True, alpha=0.5)
         plt.show()
 
+
+        def plot_pulse_identification_results(times_array, signal_to_plot, pulse_starts, pulse_ends,
+                                            template, sfreq, mf_output, ch_name=None, stim_freq_hz=None):
+            fig_template, axs = plt.subplots(3, 1, figsize=(15, 10), sharex=False)
+            fig_template.suptitle(f"Stimulation Pulse Identification Details (Est. Freq: {stim_freq_hz:.2f} Hz)" if stim_freq_hz else "Stimulation Pulse Identification Details", fontsize=16)
+
+            # Plot 1: Template
+            template_time = (np.arange(len(template)) - len(template)//2) / sfreq * 1000 # in ms
+            axs[0].plot(template_time, template, color='darkorange')
+            axs[0].set_title("Derived Artifact Template")
+            axs[0].set_xlabel("Time (ms)")
+            axs[0].set_ylabel("Amplitude")
+            axs[0].grid(True, alpha=0.5)
+
+            # Plot 2: Matched Filter Output (zoomed if many pulses)
+            axs[1].plot(times_array, mf_output, color='teal', label='Matched Filter Output')
+            if pulse_starts and len(pulse_starts) > 0:
+                axs[1].scatter(times_array[pulse_starts], mf_output[pulse_starts], color='red', marker='x', label='Detected Pulses')
+                # Zoom around first few pulses if too many
+                if len(pulse_starts) > 50: # Arbitrary limit for zooming
+                    zoom_end_time = times_array[pulse_starts[min(len(pulse_starts)-1, 10)]] + (10/stim_freq_hz if stim_freq_hz else 0.1)
+                    axs[1].set_xlim(times_array[pulse_starts[0]] - (1/stim_freq_hz if stim_freq_hz else 0.01), zoom_end_time)
+            axs[1].set_title("Matched Filter Output & Detected Peaks")
+            axs[1].set_xlabel("Time (s)")
+            axs[1].set_ylabel("Convolution Output")
+            axs[1].legend()
+            axs[1].grid(True, alpha=0.5)
+
+            # Plot 3: Signal with detected pulses
+            axs[2].plot(times_array, signal_to_plot, color='cornflowerblue', label=f'Signal ({ch_name})' if ch_name else 'Signal (Avg)')
+            if pulse_starts and pulse_ends:
+                for s_idx, e_idx in zip(pulse_starts, pulse_ends):
+                    axs[2].axvspan(times_array[s_idx], times_array[e_idx], color='salmon', alpha=0.4, lw=0)
+            if pulse_starts: # Add markers for starts for clarity if few pulses
+                 axs[2].scatter(times_array[pulse_starts], signal_to_plot[pulse_starts], color='red', marker='|', s=50, label='Pulse Start/End')
+
+            axs[2].set_title(f"Signal with Detected Pulses ({ch_name if ch_name else 'Average'})")
+            axs[2].set_xlabel("Time (s)")
+            axs[2].set_ylabel("Amplitude")
+            axs[2].legend(loc='upper right')
+            axs[2].grid(True, alpha=0.5)
+            if pulse_starts and len(pulse_starts) > 0: # Zoom to first epoch of pulses
+                start_display_time = times_array[pulse_starts[0]] - (2/stim_freq_hz if stim_freq_hz else 0.02)
+                end_display_time = times_array[min(pulse_starts[-1], pulse_starts[0] + int(10*sfreq/stim_freq_hz if stim_freq_hz else sfreq*0.2))] + (2/stim_freq_hz if stim_freq_hz else 0.02)
+                axs[2].set_xlim(max(0, start_display_time), min(times_array[-1],end_display_time))
+
+
+            plt.tight_layout(rect=[0, 0, 1, 0.96])
+            plt.show()
 
 
 
@@ -466,6 +639,32 @@ if __name__ == '__main__':
                 final_est_stim_freq = estStimFrequency # Fallback
         else:
             print("No initial stimulation frequency found. Cannot proceed to find strong channel.")
+
+
+        # --- Perform Template Matching if a stimulation frequency is found ---
+        if final_est_stim_freq is not None:
+            pulse_starts, pulse_ends, template, mf_output = identify_stim_pulses_template_matching(
+                avg_signal=avg_signal_full, # Use the full average signal
+                sfreq=sampleRate,
+                stim_freq_hz=final_est_stim_freq
+            )
+
+            if pulse_starts is not None and len(pulse_starts) > 0:
+                print(f"\nFirst 5 detected pulse start times (s): {np.array(pulse_starts[:5]) / sampleRate}")
+                
+                signal_for_plot = avg_signal_full
+                ch_name_for_plot = "Average Signal"
+                if strong_channel_idx_for_viz is not None:
+                    signal_for_plot = data[strong_channel_idx_for_viz]
+                    ch_name_for_plot = raw.ch_names[strong_channel_idx_for_viz]
+                
+                plot_pulse_identification_results(
+                    raw.times, signal_for_plot, pulse_starts, pulse_ends,
+                    template, sampleRate, mf_output, ch_name=ch_name_for_plot, stim_freq_hz=final_est_stim_freq
+                )
+            else:
+                print("Template matching did not yield any pulse detections or failed.")
+
 
         ##################### END OF BEST CHANNEL FINDER  ####################
 
