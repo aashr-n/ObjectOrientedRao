@@ -263,6 +263,9 @@ if __name__ == '__main__':
         # 3. Average the PSDs
         mean_psd_across_channels = average_psds(all_channel_psds)
         
+        mean_psd_across_channels.plot()
+        plt.show()
+
         # 4. Find the most likely stimulation frequency
         estimated_stim_freq = find_stim_freq_by_relative_prominence(mean_psd_across_channels, frequencies)
         
