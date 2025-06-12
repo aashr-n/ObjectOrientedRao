@@ -1,3 +1,5 @@
+#change so that you can store/reuse data
+
 import tkinter as tk
 from tkinter import filedialog
 import os
@@ -6,6 +8,7 @@ import mne
 import numpy as np
 import scipy.signal as signal
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec # For more control over subplots
 from mne.time_frequency import psd_array_multitaper
 from scipy.signal import find_peaks
 
@@ -23,67 +26,73 @@ tk_root.withdraw()  # Hide the main window
     # MNE logs can be verbose, so we'll only show warnings and errors.
 mne.set_log_level('WARNING')
 
-    # Open the file selection dialog
-file_path = filedialog.askopenfilename(
-    title="Select an EEG .fif file",
+    # Step 1: Select the EEG .fif file (for metadata and raw data)
+fif_file_path = filedialog.askopenfilename(
+    title="Select the EEG .fif file (for raw data and metadata)",
     filetypes=[("FIF files", "*.fif"), ("All files", "*.*")]
     )
     
-if not file_path:
+if not fif_file_path:
     print("No file was selected. Exiting the program.")
-    raise SystemExit        
-print(f"Loading selected file: {file_path}")
+    raise SystemExit
+print(f"Loading .fif file: {fif_file_path}")
+raw = mne.io.read_raw_fif(fif_file_path, preload=True)
 
-# Load the data into memory for processing
-raw = mne.io.read_raw_fif(file_path, preload=True)
 
-### Parameters first
-#  (gonna straight copy from matlab and then move from there)
-#   this would be easier to use if you made a GUI for changing these
 
+# Step 2: Select the pre-calculated PSD .npz file
+npz_file_path = filedialog.askopenfilename(
+    title="Select the pre-calculated PSD .npz file",
+    filetypes=[("NumPy archive files", "*.npz"), ("All files", "*.*")]
+)
+if not npz_file_path:
+    print("No .npz file was selected. Exiting the program.")
+    raise SystemExit
+
+
+print(f"Loading PSD data from: {npz_file_path}")
+
+try:
+    psd_data_loaded = np.load(npz_file_path)
+    psds = psd_data_loaded['psds']
+    freqs = psd_data_loaded['freqs']
+    print("PSDs and frequencies loaded successfully from .npz file.")
+    if psds.shape[0] != len(raw.ch_names):
+        print(f"Warning: Mismatch in channel count between .npz file ({psds.shape[0]}) "
+              f"and .fif file ({len(raw.ch_names)}). Ensure compatibility.")
+    if freqs.ndim != 1:
+        print(f"Warning: 'freqs' array from .npz is not 1-dimensional. This might cause issues.")
+except KeyError as e:
+    print(f"Error: The .npz file '{npz_file_path}' is missing a required key: {e}. Expected 'psds' and 'freqs'.")
+    raise SystemExit
+except Exception as e:
+    print(f"Error loading .npz file '{npz_file_path}': {e}")
+    raise SystemExit
+
+# Parameters derived from the loaded .fif file
 
 sampleRate = raw.info['sfreq']
 data = raw.get_data()                # shape (n_chan, n_samples)
-n_chan, _ = data.shape
-
-frequencyRes = 0.25 #the divisor defines the
-# Increase FFT length for finer frequency resolution (0.01 Hz)
-n_fft = int(sampleRate / frequencyRes)
 
 
 n_channels = len(raw.ch_names)
 
-print(f"The recording has {n_channels} channels.")
+n_chan_fif, _ = data.shape # Number of channels from .fif file
+n_chan_psd = psds.shape[0]   # Number of channels from loaded PSDs
 
-# 2) Compute PSD on every channel via multi‐taper
+print(f"The .fif recording has {n_chan_fif} channels. Loaded PSDs have {n_chan_psd} channels.")
+if n_chan_fif != n_chan_psd:
+    print("WARNING: Channel count mismatch may affect channel-specific analyses if channel names/order differ.")
 
-bandwidth = 0.1  # this is W, T is automatically calculated, L is based off T and W
-#lower bandwidth  =
+# These parameters were for PSD calculation, which is now skipped.
+# They are kept commented in case any downstream code might have implicitly used them,
+# but they are not used for loading PSDs.
+# frequencyRes = 0.25
+# n_fft = int(sampleRate / frequencyRes)
+# bandwidth = 0.1 # This was the bandwidth for psd_array_multitaper
 
-# --- Compute PSD per channel with progress updates ---
-psd_list = []
-for idx, ch in enumerate(raw.ch_names):
-    # Updated print statement to overwrite the previous line
-    print(f"\rCalculating PSD for channel {idx+1}/{n_channels} ({ch})...{' ' * 20}", end='', flush=True)
-    # compute PSD just for this one channel
-    psd_ch, freqs = psd_array_multitaper(
-        data[idx:idx+1],
-        sfreq=sampleRate,
-        fmin=0,
-        fmax=sampleRate / 2,
-        bandwidth=bandwidth,
-        adaptive=False,    # or True if you've resolved warnings
-        low_bias=True,
-        normalization='full',
-        verbose=False
-    )
-    psd_list.append(psd_ch[0])  # grab the 1D PSD array
-
-# Stack them into an array for averaging
-psds = np.vstack(psd_list)
-# Print a newline after the loop is done to move to the next line for subsequent prints
-print("\nMulti-taper PSD computation complete for all channels.")
-
+# The PSD calculation block below is now replaced by loading from the .npz file.
+# --- (Original PSD calculation block removed) ---
 
 
 def find_prominent_peaks(
@@ -1028,7 +1037,8 @@ def identify_stim_pulses_template_matching_v3(
 def find_stimulation_pulses_auto(
     avg_signal_epoch,
     sfreq,
-    stim_freq_hz
+    stim_freq_hz,
+    debug_plots=False # New flag to control internal plotting
 ):
     """
     Automatically detects stimulation pulses with varying numbers of components
@@ -1045,6 +1055,8 @@ def find_stimulation_pulses_auto(
         avg_signal_epoch (np.ndarray): The signal segment of the stimulation epoch.
         sfreq (float): Sampling frequency.
         stim_freq_hz (float): Estimated stimulation frequency.
+        debug_plots (bool): If True, will generate a plot showing intermediate
+                            steps of the automatic detection process.
 
     Returns:
         tuple: (pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output)
@@ -1052,6 +1064,11 @@ def find_stimulation_pulses_auto(
     print("\n--- Running Fully Automatic Pulse Detection ---")
 
     # --- Step 1: Find a single "spiky" seed peak to anchor our analysis ---
+    if stim_freq_hz <= 0:
+        print("Automatic Strategy: stim_freq_hz must be positive.")
+        return None, None, None, None
+        
+
     search_duration_s = 2.0 / stim_freq_hz
     search_end_sample = min(int(search_duration_s * sfreq), len(avg_signal_epoch))
     search_segment = avg_signal_epoch[:search_end_sample]
@@ -1083,6 +1100,19 @@ def find_stimulation_pulses_auto(
     seed_peak_location = valid_peaks[np.argmax(sharpness_scores)]
     print(f"Found spiky seed peak at sample {seed_peak_location}.")
 
+    if debug_plots:
+        plt.figure(figsize=(15, 10)) # Adjusted for 4 plots
+        
+        # Plot 1: Seed peak finding
+        ax_seed = plt.subplot(4, 1, 1)
+        search_segment_times = np.arange(len(search_segment)) / sfreq
+        ax_seed.plot(search_segment_times, search_segment, label='Initial Search Segment')
+        if candidate_peaks.any():
+            ax_seed.plot(search_segment_times[candidate_peaks], search_segment[candidate_peaks], 'o', label='Candidate Peaks', alpha=0.7)
+        ax_seed.plot(search_segment_times[seed_peak_location], search_segment[seed_peak_location], 'rx', markersize=10, label='Chosen Seed Peak')
+        ax_seed.set_title(f'Step 1: Seed Peak Detection (Found at {seed_peak_location/sfreq:.3f}s within segment)')
+        ax_seed.legend()
+
     # --- Step 2: Dynamically determine the artifact's boundaries ---
     # Define an analysis window around the seed peak (one full stimulation period)
     period_samples = int(sfreq / stim_freq_hz)
@@ -1103,24 +1133,60 @@ def find_stimulation_pulses_auto(
     dynamic_start = np.min(all_features)
     dynamic_end = np.max(all_features)
     
+    if debug_plots:
+        # Plot 2: Dynamic boundary finding
+        ax_boundary = plt.subplot(4, 1, 2)
+        analysis_snippet_times = (np.arange(len(analysis_snippet)) + analysis_win_start) / sfreq
+        ax_boundary.plot(analysis_snippet_times, analysis_snippet, label='Analysis Snippet (around seed)')
+        if peaks.any():
+            ax_boundary.plot(analysis_snippet_times[peaks], analysis_snippet[peaks], 'g^', label='Features (Peaks)')
+        if dips.any():
+            ax_boundary.plot(analysis_snippet_times[dips], analysis_snippet[dips], 'bv', label='Features (Dips)')
+        ax_boundary.axvline(analysis_snippet_times[dynamic_start], color='r', linestyle='--', label=f'Dynamic Start ({analysis_snippet_times[dynamic_start]:.3f}s)')
+        ax_boundary.axvline(analysis_snippet_times[dynamic_end], color='r', linestyle=':', label=f'Dynamic End ({analysis_snippet_times[dynamic_end]:.3f}s)')
+        ax_boundary.set_title(f'Step 2: Dynamic Artifact Boundary Detection')
+        ax_boundary.legend()
+
     # --- Step 3: Create the template using these dynamic boundaries ---
     # The template is the signal between the first and last feature
     template_dynamic = analysis_snippet[dynamic_start:dynamic_end + 1]
-    
-    # For robust matching, we place this dynamic template onto a fixed-size canvas
-    template_canvas = np.zeros(period_samples)
-    
-    # Place it in the center of the canvas
-    start_offset_on_canvas = (period_samples - len(template_dynamic)) // 2
-    if start_offset_on_canvas < 0: start_offset_on_canvas = 0
-        
-    end_offset_on_canvas = start_offset_on_canvas + len(template_dynamic)
-    if end_offset_on_canvas > period_samples: end_offset_on_canvas = period_samples
 
-    template_canvas[start_offset_on_canvas:end_offset_on_canvas] = template_dynamic[:len(template_canvas[start_offset_on_canvas:end_offset_on_canvas])]
+    if len(template_dynamic) == 0:
+        print("Automatic Strategy: Dynamic template segment is empty. Cannot proceed.")
+        return None, None, None, None
 
-    template_waveform = template_canvas
-    print(f"Dynamically created template of length {len(template_dynamic)} samples (on a {period_samples}-sample canvas).")
+    # The template_dynamic segment IS NOW the template_waveform.
+    # The canvas logic is bypassed for defining the template used in matched filter.
+    template_waveform = template_dynamic
+    print(f"Using dynamically extracted segment of length {len(template_waveform)} samples as the template.")
+
+    # --- Canvas logic (kept for potential future use or alternative strategies, but not for current template_waveform) ---
+    # template_canvas = np.zeros(period_samples)
+    # seed_peak_in_snippet_idx = seed_peak_location - analysis_win_start
+    # if dynamic_start <= seed_peak_in_snippet_idx <= dynamic_end and len(template_dynamic) > 0:
+    #     seed_peak_in_template_dynamic_idx = seed_peak_in_snippet_idx - dynamic_start
+    #     canvas_center_idx = period_samples // 2
+    #     start_offset_on_canvas = canvas_center_idx - seed_peak_in_template_dynamic_idx
+    # elif len(template_dynamic) > 0:
+    #     start_offset_on_canvas = (period_samples - len(template_dynamic)) // 2
+    # else:
+    #     start_offset_on_canvas = 0
+    # src_slice_start = max(0, -start_offset_on_canvas)
+    # dest_slice_start = max(0, start_offset_on_canvas)
+    # len_to_copy = min(len(template_dynamic) - src_slice_start, period_samples - dest_slice_start)
+    # if len_to_copy > 0:
+    #     template_canvas[dest_slice_start : dest_slice_start + len_to_copy] = \
+    #         template_dynamic[src_slice_start : src_slice_start + len_to_copy]
+    # --- End Canvas Logic ---
+
+    if debug_plots:
+        # Plot 3: Final Template Waveform (Dynamic Segment)
+        ax_template_plot = plt.subplot(4, 1, 3) # Use a clear name for this axis
+        # Time axis for the dynamic template, centered
+        dynamic_template_times = (np.arange(len(template_waveform)) - len(template_waveform)//2) / sfreq
+        ax_template_plot.plot(dynamic_template_times, template_waveform, label='Final Template (Dynamic Segment)')
+        ax_template_plot.set_title('Step 3: Final Template Waveform (Dynamic Segment)')
+        ax_template_plot.legend()
 
     # --- Step 4: Matched filter and final detection ---
     mf_kernel = template_waveform[::-1]
@@ -1137,12 +1203,134 @@ def find_stimulation_pulses_auto(
         print("Automatic Strategy: No pulses found after matched filtering.")
         return None, None, template_waveform, matched_filter_output
 
-    half_canvas = len(template_waveform) // 2
-    pulse_starts_samples = detected_pulse_centers - half_canvas
-    pulse_ends_samples = detected_pulse_centers + half_canvas
+    # Calculate pulse start and end based on the length of the (now dynamic) template_waveform
+    template_half_len = len(template_waveform) // 2
+    pulse_starts_samples = detected_pulse_centers - template_half_len
+    # Ensure pulse_ends_samples correctly reflects the full length of template_waveform
+    pulse_ends_samples = pulse_starts_samples + len(template_waveform)
+
+    if debug_plots:
+        # Plot 4: Matched Filter Output
+        ax_mf = plt.subplot(4, 1, 4)
+        epoch_times = np.arange(len(avg_signal_epoch)) / sfreq
+        ax_mf.plot(epoch_times, matched_filter_output, label='Matched Filter Output')
+        if detected_pulse_centers.any():
+            ax_mf.plot(epoch_times[detected_pulse_centers], matched_filter_output[detected_pulse_centers], 'rx', label='Detected Pulse Centers')
+        ax_mf.axhline(mf_peak_threshold, color='k', linestyle='--', label='MF Threshold')
+        ax_mf.set_title('Step 4: Matched Filter Output and Detected Pulses')
+        ax_mf.legend()
+        plt.tight_layout() # Apply layout
+        # plt.show() # Removed: will be called once in main
 
     print(f"Identified {len(pulse_starts_samples)} stimulation pulses automatically.")
     return pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output
+
+
+# --- Plotting function for pulse identification results ---
+def plot_template_and_overlaid_pulses(
+    signal_to_plot,       # The time-domain signal (e.g., one channel or average)
+    times_array,          # Time vector for signal_to_plot
+    pulse_starts_samples, # Absolute start samples of pulses
+    pulse_ends_samples,   # Absolute end samples of pulses    
+    template_waveform,    # The template used for matching
+    sfreq,                # Sampling frequency
+    mean_signal_overall=None, # Default argument moved later
+    channel_name="Signal",# Name of the signal being plotted
+    stim_freq_hz=None     # Estimated stimulation frequency (for title)
+):
+    """
+    Visualizes the derived template and the detected pulses overlaid on the time series.
+    Panel 1: The derived template waveform.
+    Panel 2: The signal with detected pulse durations highlighted.
+    """
+    fig, (ax_template, ax_signal) = plt.subplots(2, 1, figsize=(18, 10), sharex=False,
+                                               gridspec_kw={'height_ratios': [1, 2]})
+
+    title_str = f'Pulse Identification Results (Signal: {channel_name})'
+    if stim_freq_hz:
+        title_str = f'Pulse Identification Results (Est. Stim Freq: {stim_freq_hz:.2f} Hz, Signal: {channel_name})'
+    fig.suptitle(title_str, fontsize=16)
+
+    # panel 1 : template waveform
+    if template_waveform is not None and len(template_waveform) > 0:
+        template_time_axis = (np.arange(len(template_waveform)) - len(template_waveform) // 2) / sfreq # Centered
+        ax_template.plot(template_time_axis, template_waveform, color='darkorange', label='Derived Template Waveform')
+        ax_template.set_xlabel('Time relative to template center (s)')
+        ax_template.set_ylabel('Amplitude')
+        ax_template.set_title('Derived Template Waveform')
+        ax_template.legend(loc='upper right')
+    else:
+        ax_template.text(0.5, 0.5, "Template not available or empty",
+                         ha='center', va='center', transform=ax_template.transAxes, fontsize=12, color='grey')
+        ax_template.set_title('Derived Template Waveform (Not Available)')
+        ax_template.set_xlabel('Time relative to template center (s)')
+        ax_template.set_ylabel('Amplitude')
+    ax_template.grid(True, alpha=0.5)
+
+    # Panel 2: Signal with Overlaid Detected Pulses (using the template)
+    ax_signal.plot(times_array, signal_to_plot, label=f'Original Signal: {channel_name}', color='cornflowerblue', alpha=0.7)
+
+    if mean_signal_overall is not None and channel_name != "Average" and len(mean_signal_overall) == len(times_array):
+        ax_signal.plot(times_array, mean_signal_overall, label='Overall Mean Signal', color='grey', linestyle=':', alpha=0.6)
+
+    
+    if pulse_starts_samples is not None and len(pulse_starts_samples) > 0 and \
+       pulse_ends_samples is not None and len(pulse_starts_samples) == len(pulse_ends_samples):
+        # Ensure pulse_ends_samples is also valid
+        
+        for i, (start_samp, end_samp) in enumerate(zip(pulse_starts_samples, pulse_ends_samples)):
+            start_time = start_samp / sfreq
+            end_time = end_samp / sfreq
+            
+            # Ensure start and end times are within the plot limits if necessary,
+            # though axvspan usually handles this okay.
+            label = 'Detected Pulse Artifacts' if i == 0 else '_nolegend_'
+            ax_signal.axvspan(start_time, end_time, color='salmon', alpha=0.4, label=label)
+
+    ax_signal.set_xlabel('Time (s)')
+    ax_signal.set_ylabel('Amplitude')
+    ax_signal.set_title(f'Time Series of {channel_name} with Highlighted Pulse Artifacts')
+    ax_signal.legend(loc='upper right')
+    ax_signal.grid(True, alpha=0.5)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust rect for suptitle and bottom labels
+    # plt.show() # Removed: will be called once in main
+
+# --- Main Execution Block (Corrected) ---
+
+def plot_comparison_psds(
+    freqs_array,
+    mean_psd_array,
+    strong_channel_psd_array,
+    strong_channel_name,
+    estimated_stim_freq=None
+):
+    """
+    Plots the mean PSD and the PSD of the strongest channel for comparison.
+
+    Args:
+        freqs_array (np.ndarray): Array of frequencies.
+        mean_psd_array (np.ndarray): PSD values for the mean across channels.
+        strong_channel_psd_array (np.ndarray): PSD values for the strongest channel.
+        strong_channel_name (str): Name of the strongest channel.
+        estimated_stim_freq (float, optional): Estimated stimulation frequency to mark.
+    """
+    plt.figure(figsize=(12, 7))
+    plt.plot(freqs_array, 10 * np.log10(mean_psd_array), label='Mean PSD across all channels', alpha=0.8)
+    if strong_channel_psd_array is not None and strong_channel_name:
+        plt.plot(freqs_array, 10 * np.log10(strong_channel_psd_array), label=f'PSD of Channel: {strong_channel_name}', alpha=0.8)
+
+    if estimated_stim_freq is not None: # Changed line style and color
+        plt.axvline(estimated_stim_freq, color='green', linestyle='-', alpha=0.6, linewidth=1.5, label=f'Est. Stim Freq: {estimated_stim_freq:.2f} Hz')
+
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Power Spectral Density (dB/Hz)')
+    plt.title('Comparison of Mean PSD and Strongest Channel PSD')
+    plt.legend()
+    plt.grid(True, which="both", ls="-", alpha=0.5)
+    plt.xlim(max(0, freqs_array.min()), min(freqs_array.max(), 150)) # Limit x-axis for better viz, e.g., up to 150 Hz
+    plt.tight_layout()
+    # plt.show() # Will be called once in main
 
 
 # --- Main Execution Block (Corrected) ---
@@ -1178,6 +1366,20 @@ if __name__ == '__main__':
         else:
             print("No initial stimulation frequency found.")
 
+        # Plot the comparison PSDs if data is available
+        if 'mean_psd' in locals() and 'freqs' in locals():
+            psd_strong_ch_for_plot = None
+            ch_name_strong_for_plot = "N/A"
+            if strong_channel_idx_for_viz is not None and psds is not None:
+                psd_strong_ch_for_plot = psds[strong_channel_idx_for_viz, :]
+                ch_name_strong_for_plot = raw.ch_names[strong_channel_idx_for_viz]
+            plot_comparison_psds(
+                freqs_array=freqs,
+                mean_psd_array=mean_psd,
+                strong_channel_psd_array=psd_strong_ch_for_plot,
+                strong_channel_name=ch_name_strong_for_plot,
+                estimated_stim_freq=final_est_stim_freq)
+
         # 3. Determine and Visualize the Stimulation Epoch
         epoch_start_s, epoch_end_s = None, None
         if final_est_stim_freq is not None:
@@ -1200,33 +1402,60 @@ if __name__ == '__main__':
                 pulse_starts_rel, pulse_ends_rel, template, mf_out = find_stimulation_pulses_auto(
                     avg_signal_epoch=signal_for_template,
                     sfreq=sampleRate,
-                    stim_freq_hz=final_est_stim_freq
+                    stim_freq_hz=final_est_stim_freq,
+                    debug_plots=True # <<< Enable debug plots here
                 )
 
                 # 5. Plot the Final Results
-                if pulse_starts_rel is not None:
+                # Initialize plot variables to safe defaults
+                pulse_starts_abs, pulse_ends_abs = None, None # Add pulse_ends_abs back
+                current_template_for_plot = np.array([]) # Ensure it's an empty array, not None
+
+                if pulse_starts_rel is not None and len(pulse_starts_rel) > 0:
                     pulse_starts_abs = np.array(pulse_starts_rel) + offset_samples
                     pulse_ends_abs = np.array(pulse_ends_rel) + offset_samples
-                    mf_full = np.convolve(avg_signal_full, template[::-1], mode='same')
-                    
+
                     signal_for_plot = data[strong_channel_idx_for_viz] if strong_channel_idx_for_viz is not None else avg_signal_full
                     ch_name_for_plot = raw.ch_names[strong_channel_idx_for_viz] if strong_channel_idx_for_viz is not None else "Average"
 
-                    # Assuming you have a plot_pulse_identification_results function defined elsewhere
-                    # If not, you'd need to add its definition back in.
-                    # For now, let's assume it exists.
-                    # plot_pulse_identification_results(...) # You would call your plotting function here.
-                    print("Plotting of results would occur here.")
+                    if template is not None and len(template) > 0:
+                        current_template_for_plot = np.asarray(template).squeeze()
+                        if current_template_for_plot.ndim == 0 or len(current_template_for_plot) == 0:
+                            print("Warning: Template is scalar or empty after squeeze. MF output will be zero for plotting.")
+                            current_template_for_plot = np.array([]) # Ensure it's an empty array for plotting func
+                        # else:
+                            # mf_full_for_plot and detected_pulse_centers_abs_for_plot were calculated here but are not used by the current plot
+                    else:
+                        print("Template not available or empty for plotting.")
+                        # current_template_for_plot is already an empty array
+                    
+                    plot_template_and_overlaid_pulses(
+                        signal_to_plot=signal_for_plot,
+                        times_array=raw.times,
+                        pulse_starts_samples=pulse_starts_abs.astype(int) if pulse_starts_abs is not None else np.array([]),
+                        mean_signal_overall=avg_signal_full, # Pass the overall mean signal
+                        pulse_ends_samples=pulse_ends_abs.astype(int) if pulse_ends_abs is not None else np.array([]),
+                        template_waveform=current_template_for_plot,
+                        sfreq=sampleRate,
+                        channel_name=ch_name_for_plot,
+                        stim_freq_hz=final_est_stim_freq
+                    )
+                else: # No pulses identified (pulse_starts_rel is None or empty)
+                    print("No pulses identified by automatic function, or template generation failed. Skipping full results plot.")
+                    # You could optionally plot just the raw signal here if desired, e.g.:
+                    # plt.figure(figsize=(15,5))
+                    # plt.plot(raw.times, avg_signal_full)
+                    # plt.title("Average Signal (No Pulses Detected for Plotting)")
+                    # plt.show()
+            else: # if len(signal_for_template) == 0
+                print("Signal for template matching is empty, skipping pulse identification and plotting.")
+        else: # if not final_est_stim_freq
+            print("No stimulation frequency estimated, skipping pulse identification and plotting.")
 
+        # Show all generated Matplotlib figures at the end
+        plt.show()
 
     except SystemExit:
         print("Program execution cancelled by user.")
-    except NameError as e:
-        # This will catch if the plotting function is missing, which it is in the provided snippet.
-        if 'plot_pulse_identification_results' in str(e):
-             print("\nDIAGNOSIS: The function 'plot_pulse_identification_results' is not defined.")
-             print("Please ensure the definition for your plotting function is included in the script.")
-        else:
-             print(f"A NameError occurred: {e}")
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
