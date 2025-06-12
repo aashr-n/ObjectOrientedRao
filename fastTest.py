@@ -1038,7 +1038,8 @@ def find_stimulation_pulses_auto(
     avg_signal_epoch,
     sfreq,
     stim_freq_hz,
-    debug_plots=False # New flag to control internal plotting
+    template_half_width_ms=7.0, # New: Half-width of template in ms (e.g., 7ms before and 7ms after peak)
+    debug_plots=False 
 ):
     """
     Automatically detects stimulation pulses with varying numbers of components
@@ -1046,8 +1047,8 @@ def find_stimulation_pulses_auto(
 
     It works by:
     1. Finding a single "spiky" seed peak at the epoch onset.
-    2. Analyzing the signal around this peak to dynamically find the start and
-       end boundaries of the entire multi-component artifact.
+    2. Extracting a template from a fixed-width window around this
+       most prominent seed peak.
     3. Creating a template from these dynamic boundaries.
     4. Using this template in a matched filter to find all other pulses.
 
@@ -1056,7 +1057,9 @@ def find_stimulation_pulses_auto(
         sfreq (float): Sampling frequency.
         stim_freq_hz (float): Estimated stimulation frequency.
         debug_plots (bool): If True, will generate a plot showing intermediate
-                            steps of the automatic detection process.
+                            steps of the automatic detection process.        
+        template_half_width_ms (float): The half-width of the template extraction window
+                                     in milliseconds, centered on the seed peak.
 
     Returns:
         tuple: (pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output)
@@ -1079,107 +1082,99 @@ def find_stimulation_pulses_auto(
 
     # Find candidate peaks based on their height in the absolute signal
     # Using median and std for a robust threshold against outliers in the segment
+    # Calculate the threshold first
     height_threshold_seed = np.median(np.abs(search_segment)) + 2.0 * np.std(np.abs(search_segment))
-    candidate_peaks_indices, _ = find_peaks(np.abs(search_segment), height=height_threshold_seed)
 
+    # --- TEMPORARY DEBUG PLOT ---
+    if debug_plots: # Only plot if debug_plots is True
+        # import matplotlib.pyplot as plt # Already imported at the top of the file
+        plt.figure(figsize=(12, 6))
+        plt.title(f"Debug: search_segment for Seed Peak (first {search_duration_s:.3f}s of epoch)")
+        time_axis_search_segment = np.arange(len(search_segment)) / sfreq
+        plt.plot(time_axis_search_segment, search_segment, label=f'search_segment (raw)')
+        plt.plot(time_axis_search_segment, np.abs(search_segment), label='np.abs(search_segment)', linestyle='--')
+        plt.axhline(height_threshold_seed, color='r', linestyle=':', label=f'height_threshold_seed ({height_threshold_seed:.2f})')
+        plt.xlabel("Time in search_segment (s)")
+        plt.ylabel("Amplitude")
+        plt.legend()
+        plt.show() # Show this plot immediately to diagnose
+
+    candidate_peaks_indices, _ = find_peaks(np.abs(search_segment), height=height_threshold_seed)
+    
     if not candidate_peaks_indices.any():
         print(f"Automatic Strategy: No candidate seed peaks found with height > {height_threshold_seed:.2f} in the initial search segment.")
         return None, None, None, None
+
+    # Filter out peaks at the very edges of the search_segment
+    # A peak at index 0 or len(search_segment)-1 is an edge peak.
+    # We require peaks to have at least one sample on either side within the search_segment.
+    non_edge_mask = (candidate_peaks_indices > 0) & (candidate_peaks_indices < len(search_segment) - 1)
+    candidate_peaks_indices_filtered = candidate_peaks_indices[non_edge_mask]
+
+    if not candidate_peaks_indices_filtered.any():
+        print(f"Automatic Strategy: All candidate peaks found were at the edges of the search segment ({len(search_segment)} samples long). No valid non-edge seed peak found.")
+        # Optionally, you could plot the search_segment here if debug_plots is True to see why
+        return None, None, None, None
         
     # Select the candidate peak that has the largest absolute amplitude in the original (not absolute) search_segment
-    peak_amplitudes_at_candidates = np.abs(search_segment[candidate_peaks_indices])
+    # Use the filtered list of candidates
+    peak_amplitudes_at_candidates = np.abs(search_segment[candidate_peaks_indices_filtered])
     
     if not peak_amplitudes_at_candidates.any(): # Should not happen if candidate_peaks_indices is not empty
-        print("Automatic Strategy: Could not get amplitudes for candidate peaks.")
+        print("Automatic Strategy: Could not get amplitudes for filtered candidate peaks.") # Should be caught by previous check
         return None, None, None, None
 
-    # Find the index of the max amplitude among candidates
     idx_of_max_amplitude_in_candidates = np.argmax(peak_amplitudes_at_candidates)
     # Get the actual sample index in search_segment (and thus avg_signal_epoch)
-    seed_peak_location = candidate_peaks_indices[idx_of_max_amplitude_in_candidates]
+    seed_peak_location = candidate_peaks_indices_filtered[idx_of_max_amplitude_in_candidates]
     
     print(f"Found seed peak (max amplitude in initial {search_duration_s:.3f}s segment) at sample {seed_peak_location} "
           f"(value: {search_segment[seed_peak_location]:.2f}, abs value: {np.abs(search_segment[seed_peak_location]):.2f}).")
 
     if debug_plots:
-        plt.figure(figsize=(15, 10)) # Adjusted for 4 plots
+        plt.figure(figsize=(15, 8)) # Adjusted for 3 plots now
         
         # Plot 1: Seed peak finding
         ax_seed = plt.subplot(4, 1, 1)
         search_segment_times = np.arange(len(search_segment)) / sfreq
         ax_seed.plot(search_segment_times, search_segment, label='Initial Search Segment')
-        # Plot all candidates found by find_peaks
-        if candidate_peaks_indices.any():
-            ax_seed.plot(search_segment_times[candidate_peaks_indices], search_segment[candidate_peaks_indices], 'o', label='Candidate Peaks for Seed', alpha=0.7)
+        # Plot all non-edge candidate peaks
+        if candidate_peaks_indices_filtered.any():
+            ax_seed.plot(search_segment_times[candidate_peaks_indices_filtered], search_segment[candidate_peaks_indices_filtered], 'o', label='Non-Edge Candidate Peaks', alpha=0.7)
         ax_seed.plot(search_segment_times[seed_peak_location], search_segment[seed_peak_location], 'rx', markersize=10, label='Chosen Seed Peak')
         ax_seed.set_title(f'Step 1: Seed Peak Detection (Found at {seed_peak_location/sfreq:.3f}s within segment)')
         ax_seed.legend()
 
-    # --- Step 2: Dynamically determine the artifact's boundaries ---
-    # Define an analysis window around the seed peak (one full stimulation period)
+    # --- Step 2: Extract Template based on seed_peak_location and fixed window ---
+    samples_before_peak = int((template_half_width_ms / 1000.0) * sfreq)
+    samples_after_peak = samples_before_peak # Symmetric window
+    template_total_len = samples_before_peak + samples_after_peak
+
+    if template_total_len <= 0:
+        print(f"Automatic Strategy: Template total length is {template_total_len}. Check template_half_width_ms.")
+        return None, None, None, None
+
+    # Define window in avg_signal_epoch coordinates
+    window_start_abs = seed_peak_location - samples_before_peak
+    window_end_abs = seed_peak_location + samples_after_peak # Exclusive for slicing if used directly
+
+    # Extract the snippet, padding with zeros at the edges
+    template_waveform = np.zeros(template_total_len)
+    
+    # Source slice from avg_signal_epoch
+    src_start_in_epoch = max(0, window_start_abs)
+    src_end_in_epoch = min(len(avg_signal_epoch), window_end_abs)
+    
+    # Destination slice in template_waveform
+    dest_start_in_template = max(0, -window_start_abs) # If window_start_abs is negative
+    dest_end_in_template = dest_start_in_template + (src_end_in_epoch - src_start_in_epoch)
+
+    if dest_start_in_template < dest_end_in_template and dest_end_in_template <= template_total_len:
+        template_waveform[dest_start_in_template:dest_end_in_template] = avg_signal_epoch[src_start_in_epoch:src_end_in_epoch]
+    
+    print(f"Extracted template of length {len(template_waveform)} samples around seed peak (window: +/- {template_half_width_ms} ms).")
+
     period_samples = int(sfreq / stim_freq_hz)
-    analysis_win_start = max(0, seed_peak_location - period_samples // 2)
-    analysis_win_end = min(len(avg_signal_epoch), seed_peak_location + period_samples // 2)
-    analysis_snippet = avg_signal_epoch[analysis_win_start:analysis_win_end]
-
-    # Find ALL bumps and dips within this window to find the true start and end
-    feature_thresh = 1.0 * np.std(analysis_snippet) # Lenient threshold
-    peaks, _ = find_peaks(analysis_snippet, height=feature_thresh, distance=2)
-    dips, _ = find_peaks(-analysis_snippet, height=feature_thresh, distance=2)
-    
-    all_features = np.concatenate((peaks, dips))
-    if not all_features.any():
-        print("Automatic Strategy: Could not find features to define artifact boundaries.")
-        return None, None, None, None
-        
-    dynamic_start = np.min(all_features)
-    dynamic_end = np.max(all_features)
-    
-    if debug_plots:
-        # Plot 2: Dynamic boundary finding
-        ax_boundary = plt.subplot(4, 1, 2)
-        analysis_snippet_times = (np.arange(len(analysis_snippet)) + analysis_win_start) / sfreq
-        ax_boundary.plot(analysis_snippet_times, analysis_snippet, label='Analysis Snippet (around seed)')
-        if peaks.any():
-            ax_boundary.plot(analysis_snippet_times[peaks], analysis_snippet[peaks], 'g^', label='Features (Peaks)')
-        if dips.any():
-            ax_boundary.plot(analysis_snippet_times[dips], analysis_snippet[dips], 'bv', label='Features (Dips)')
-        ax_boundary.axvline(analysis_snippet_times[dynamic_start], color='r', linestyle='--', label=f'Dynamic Start ({analysis_snippet_times[dynamic_start]:.3f}s)')
-        ax_boundary.axvline(analysis_snippet_times[dynamic_end], color='r', linestyle=':', label=f'Dynamic End ({analysis_snippet_times[dynamic_end]:.3f}s)')
-        ax_boundary.set_title(f'Step 2: Dynamic Artifact Boundary Detection')
-        ax_boundary.legend()
-
-    # --- Step 3: Create the template using these dynamic boundaries ---
-    # The template is the signal between the first and last feature
-    template_dynamic = analysis_snippet[dynamic_start:dynamic_end + 1]
-
-    if len(template_dynamic) == 0:
-        print("Automatic Strategy: Dynamic template segment is empty. Cannot proceed.")
-        return None, None, None, None
-
-    # The template_dynamic segment IS NOW the template_waveform.
-    # The canvas logic is bypassed for defining the template used in matched filter.
-    template_waveform = template_dynamic
-    print(f"Using dynamically extracted segment of length {len(template_waveform)} samples as the template.")
-
-    # --- Canvas logic (kept for potential future use or alternative strategies, but not for current template_waveform) ---
-    # template_canvas = np.zeros(period_samples)
-    # seed_peak_in_snippet_idx = seed_peak_location - analysis_win_start
-    # if dynamic_start <= seed_peak_in_snippet_idx <= dynamic_end and len(template_dynamic) > 0:
-    #     seed_peak_in_template_dynamic_idx = seed_peak_in_snippet_idx - dynamic_start
-    #     canvas_center_idx = period_samples // 2
-    #     start_offset_on_canvas = canvas_center_idx - seed_peak_in_template_dynamic_idx
-    # elif len(template_dynamic) > 0:
-    #     start_offset_on_canvas = (period_samples - len(template_dynamic)) // 2
-    # else:
-    #     start_offset_on_canvas = 0
-    # src_slice_start = max(0, -start_offset_on_canvas)
-    # dest_slice_start = max(0, start_offset_on_canvas)
-    # len_to_copy = min(len(template_dynamic) - src_slice_start, period_samples - dest_slice_start)
-    # if len_to_copy > 0:
-    #     template_canvas[dest_slice_start : dest_slice_start + len_to_copy] = \
-    #         template_dynamic[src_slice_start : src_slice_start + len_to_copy]
-    # --- End Canvas Logic ---
     
     peak_offset_in_template = 0 # Initialize
     if len(template_waveform) > 0:
@@ -1187,14 +1182,14 @@ def find_stimulation_pulses_auto(
 
     if debug_plots:
         # Plot 3: Final Template Waveform (Dynamic Segment)
-        ax_template_plot = plt.subplot(4, 1, 3) # Use a clear name for this axis
+        ax_template_plot = plt.subplot(3, 1, 2) # Now subplot 2 of 3
         # Time axis for the dynamic template, centered
         dynamic_template_times = (np.arange(len(template_waveform)) - len(template_waveform)//2) / sfreq
-        ax_template_plot.plot(dynamic_template_times, template_waveform, label='Final Template (Dynamic Segment)')
+        ax_template_plot.plot(dynamic_template_times, template_waveform, label=f'Final Template (Window: +/- {template_half_width_ms} ms)')
         # Mark the prominent peak within the template
         time_of_peak_in_template_plot = (peak_offset_in_template - (len(template_waveform) // 2)) / sfreq
         ax_template_plot.axvline(time_of_peak_in_template_plot, color='lime', linestyle=':', linewidth=2, label=f'Prominent Peak in Template (New Effective Center)')
-        ax_template_plot.set_title('Step 3: Final Template Waveform (Dynamic Segment)')
+        ax_template_plot.set_title('Step 2: Final Template Waveform')
         ax_template_plot.legend()
 
     # --- Step 4: Matched filter and final detection ---
@@ -1276,7 +1271,7 @@ def find_stimulation_pulses_auto(
 
     if debug_plots:
         # Plot 4: Matched Filter Output
-        ax_mf = plt.subplot(4, 1, 4)
+        ax_mf = plt.subplot(3, 1, 3) # Now subplot 3 of 3
         epoch_times = np.arange(len(avg_signal_epoch)) / sfreq
         ax_mf.plot(epoch_times, matched_filter_output, label='Matched Filter Output')
         if detected_pulse_centers.any():
