@@ -612,6 +612,28 @@ def find_stimulation_pulses_auto(
     if dest_start_in_template < dest_end_in_template and dest_end_in_template <= template_total_len:
         template_waveform[dest_start_in_template:dest_end_in_template] = avg_signal_epoch[src_start_in_epoch:src_end_in_epoch]
     
+    # --- Scale the template waveform based on the seed peak amplitude ---
+    # The seed_peak_location is an absolute index in avg_signal_epoch.
+    # Its index within the extracted template_waveform is seed_peak_location - window_start_abs.
+    seed_peak_index_in_template = seed_peak_location - window_start_abs
+
+    # Ensure the index is valid within the extracted (potentially padded) template
+    if 0 <= seed_peak_index_in_template < len(template_waveform):
+        original_seed_amplitude = avg_signal_epoch[seed_peak_location]
+        template_peak_amplitude_at_seed_loc = template_waveform[seed_peak_index_in_template]
+
+        # Calculate scaling factor
+        scaling_factor = 1.0 # Default to no scaling
+        # Avoid division by zero or very small numbers
+        if np.abs(template_peak_amplitude_at_seed_loc) > 1e-9:
+             scaling_factor = original_seed_amplitude / template_peak_amplitude_at_seed_loc
+             template_waveform = template_waveform * scaling_factor
+             print(f"Scaled template waveform by factor: {scaling_factor:.4f}")
+        else:
+             print("Warning: Amplitude at seed peak location in template is near zero. Skipping template scaling.")
+    else:
+        print(f"Warning: Seed peak index ({seed_peak_index_in_template}) is outside template bounds ({len(template_waveform)}). Skipping template scaling.")
+
     print(f"Extracted template of length {len(template_waveform)} samples around seed peak (window: +/- {template_half_width_s * 1000:.2f} ms).")
 
     period_samples = int(sfreq / stim_freq_hz)
@@ -636,12 +658,11 @@ def find_stimulation_pulses_auto(
     mf_kernel = template_waveform[::-1]
     matched_filter_output = np.convolve(avg_signal_epoch, mf_kernel, mode='same')
 
-    mf_peak_percentile = 85 # Define the percentile value
-    mf_peak_threshold = np.percentile(matched_filter_output, mf_peak_percentile)
+    # MF threshold is removed as per request. We will find all peaks based on distance.
     mf_distance_samples = int(0.6 * period_samples)
 
     detected_pulse_centers, _ = find_peaks(
-        matched_filter_output, height=mf_peak_threshold, distance=mf_distance_samples
+        matched_filter_output, height=None, distance=mf_distance_samples # height=None removes thresholding
     )
 
     if not detected_pulse_centers.size > 0: # Check if array is not empty
@@ -687,26 +708,72 @@ def find_stimulation_pulses_auto(
                 confirmed_first_pulse_center = center_idx
         
         print(f"Automatic Strategy: Confirmed first pulse at sample {confirmed_first_pulse_center} "
-              f"(MF score: {max_mf_value_for_first:.2f}) within leeway of seed peak.")
+              f"(MF score: {max_mf_value_for_first:.2f}) within leeway of initial seed peak.")
         final_detected_pulse_centers_list.append(confirmed_first_pulse_center)
 
-        # Add subsequent pulses from the original `detected_pulse_centers` list,
-        # ensuring they are after the `confirmed_first_pulse_center`.
-        # The original `find_peaks` call already ensured they are spaced by `mf_distance_samples`.
-        for center_idx in detected_pulse_centers:
-            if center_idx > confirmed_first_pulse_center:
-                final_detected_pulse_centers_list.append(center_idx)
+        # Iteratively find subsequent pulses based on the new criteria
+        # For aligning the pulse window, we use the geometric center of the template.
+        alignment_offset_in_template_for_loop = len(template_waveform) // 2 # Same as alignment_offset_in_template later
+        len_template_waveform_for_loop = len(template_waveform)
+
+        # Start with the end of the first confirmed pulse
+        last_detected_pulse_center = confirmed_first_pulse_center # Keep track of the center of the last pulse
+        current_pulse_start_sample = (last_detected_pulse_center - alignment_offset_in_template_for_loop)
+        current_pulse_end_sample = current_pulse_start_sample + len_template_waveform_for_loop
+        
+        # `detected_pulse_centers` contains all peaks from the initial MF scan,
+        # already filtered by height (mf_peak_threshold) and distance (mf_distance_samples).
+        # We sort them to process candidates in order.
+        all_initial_candidates = sorted(detected_pulse_centers)
+
+        # period_samples is already defined as int(sfreq / stim_freq_hz)
+
+        while True:
+            potential_next_pulses_in_window = []
+            # Find candidates whose *center* is within one period *after the end* of the last found pulse
+            for candidate_idx in all_initial_candidates:
+                # Candidate must start after the end of the current pulse
+                if candidate_idx <= current_pulse_end_sample: # Check if center is after the end
+                                                              # or if it's a previously considered/added pulse center
+                    continue 
+                
+                # Condition 1: Candidate center is < 1 period from the END of the previous pulse.
+                cond1_max_dist = (candidate_idx - current_pulse_end_sample) < period_samples
+                # Condition 2: Candidate center is >= 1 period from the START of the previous pulse.
+                cond2_min_dist = (candidate_idx - current_pulse_start_sample) >= period_samples
+
+                if cond1_max_dist and cond2_min_dist:
+                    potential_next_pulses_in_window.append(candidate_idx)
+                elif not cond1_max_dist: # (candidate_idx - current_pulse_end_sample) >= period_samples
+                    # Since all_initial_candidates is sorted, no further candidates will be in this window
+                    # (violating cond1_max_dist), no subsequent candidates will satisfy it either.
+                    break 
+            
+            if not potential_next_pulses_in_window:
+                break # No more pulses found in the next 1-period window from the last detected one
+            # Select the pulse with the highest matched filter score from this window
+            next_pulse_center = potential_next_pulses_in_window[
+                np.argmax(matched_filter_output[potential_next_pulses_in_window])
+            ]
+            
+            final_detected_pulse_centers_list.append(next_pulse_center)
+            
+            # Update references for the next iteration based on the newly added pulse
+            last_detected_pulse_center = next_pulse_center
+            current_pulse_start_sample = (last_detected_pulse_center - alignment_offset_in_template_for_loop)
+            current_pulse_end_sample = current_pulse_start_sample + len_template_waveform_for_loop
         
         detected_pulse_centers = np.array(final_detected_pulse_centers_list) # Update with refined list
 
     # --- Calculate pulse start and end based on the (potentially refined) detected_pulse_centers ---
-    # The peak_offset_in_template was calculated before the debug plot for Step 3
-    # If template_waveform is empty, peak_offset_in_template is 0, which is safe.
+    # For aligning the pulse window, we use the geometric center of the template,
+    # ensuring that detected_pulse_centers corresponds to the center of the highlighted artifact.
+    # The seed_peak_location was placed at the geometric center of the template during extraction.
+    alignment_offset_in_template = len(template_waveform) // 2
     
-    pulse_starts_samples = detected_pulse_centers - peak_offset_in_template
+    pulse_starts_samples = detected_pulse_centers - alignment_offset_in_template
     # Ensure pulse_ends_samples correctly reflects the full length of template_waveform.
-    # The length of the artifact is still len(template_waveform).
-    pulse_ends_samples = pulse_starts_samples + len(template_waveform) 
+    pulse_ends_samples = pulse_starts_samples + len(template_waveform)
 
 
     if debug_plots:
@@ -716,7 +783,7 @@ def find_stimulation_pulses_auto(
         ax_mf.plot(epoch_times, matched_filter_output, label='Matched Filter Output')
         if detected_pulse_centers.any():
             ax_mf.plot(epoch_times[detected_pulse_centers], matched_filter_output[detected_pulse_centers], 'rx', markersize=8, label='Final Detected Pulse Centers')
-        ax_mf.axhline(mf_peak_threshold, color='k', linestyle='--', label=f'MF Threshold ({mf_peak_percentile}th percentile)')
+        # ax_mf.axhline(mf_peak_threshold, color='k', linestyle='--', label=f'MF Threshold ({mf_peak_percentile}th percentile)') # Threshold line removed
         ax_mf.set_title('Step 4: Matched Filter Output and Detected Pulses')
         ax_mf.legend()
         plt.tight_layout() # Apply layout
