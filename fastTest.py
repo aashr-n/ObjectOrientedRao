@@ -1077,28 +1077,29 @@ def find_stimulation_pulses_auto(
         print("Automatic Strategy: Epoch segment too short to find a seed peak.")
         return None, None, None, None
 
-    # Find candidate peaks to test for "spikiness"
-    thresh = np.mean(np.abs(search_segment)) + 1.5 * np.std(np.abs(search_segment))
-    candidate_peaks, _ = find_peaks(np.abs(search_segment), height=thresh)
+    # Find candidate peaks based on their height in the absolute signal
+    # Using median and std for a robust threshold against outliers in the segment
+    height_threshold_seed = np.median(np.abs(search_segment)) + 2.0 * np.std(np.abs(search_segment))
+    candidate_peaks_indices, _ = find_peaks(np.abs(search_segment), height=height_threshold_seed)
 
-    if not candidate_peaks.any():
-        print("Automatic Strategy: No candidate seed peaks found.")
-        return None, None, None, None
-
-    # Find the spikiest among the candidates
-    sharpness_scores, valid_peaks = [], []
-    for p_idx in candidate_peaks:
-        if 1 <= p_idx < len(search_segment) - 1:
-            sharpness = np.abs(search_segment[p_idx] - search_segment[p_idx - 1]) + np.abs(search_segment[p_idx] - search_segment[p_idx + 1])
-            sharpness_scores.append(sharpness)
-            valid_peaks.append(p_idx)
-    
-    if not valid_peaks:
-        print("Automatic Strategy: No valid peaks for sharpness calculation.")
+    if not candidate_peaks_indices.any():
+        print(f"Automatic Strategy: No candidate seed peaks found with height > {height_threshold_seed:.2f} in the initial search segment.")
         return None, None, None, None
         
-    seed_peak_location = valid_peaks[np.argmax(sharpness_scores)]
-    print(f"Found spiky seed peak at sample {seed_peak_location}.")
+    # Select the candidate peak that has the largest absolute amplitude in the original (not absolute) search_segment
+    peak_amplitudes_at_candidates = np.abs(search_segment[candidate_peaks_indices])
+    
+    if not peak_amplitudes_at_candidates.any(): # Should not happen if candidate_peaks_indices is not empty
+        print("Automatic Strategy: Could not get amplitudes for candidate peaks.")
+        return None, None, None, None
+
+    # Find the index of the max amplitude among candidates
+    idx_of_max_amplitude_in_candidates = np.argmax(peak_amplitudes_at_candidates)
+    # Get the actual sample index in search_segment (and thus avg_signal_epoch)
+    seed_peak_location = candidate_peaks_indices[idx_of_max_amplitude_in_candidates]
+    
+    print(f"Found seed peak (max amplitude in initial {search_duration_s:.3f}s segment) at sample {seed_peak_location} "
+          f"(value: {search_segment[seed_peak_location]:.2f}, abs value: {np.abs(search_segment[seed_peak_location]):.2f}).")
 
     if debug_plots:
         plt.figure(figsize=(15, 10)) # Adjusted for 4 plots
@@ -1107,8 +1108,9 @@ def find_stimulation_pulses_auto(
         ax_seed = plt.subplot(4, 1, 1)
         search_segment_times = np.arange(len(search_segment)) / sfreq
         ax_seed.plot(search_segment_times, search_segment, label='Initial Search Segment')
-        if candidate_peaks.any():
-            ax_seed.plot(search_segment_times[candidate_peaks], search_segment[candidate_peaks], 'o', label='Candidate Peaks', alpha=0.7)
+        # Plot all candidates found by find_peaks
+        if candidate_peaks_indices.any():
+            ax_seed.plot(search_segment_times[candidate_peaks_indices], search_segment[candidate_peaks_indices], 'o', label='Candidate Peaks for Seed', alpha=0.7)
         ax_seed.plot(search_segment_times[seed_peak_location], search_segment[seed_peak_location], 'rx', markersize=10, label='Chosen Seed Peak')
         ax_seed.set_title(f'Step 1: Seed Peak Detection (Found at {seed_peak_location/sfreq:.3f}s within segment)')
         ax_seed.legend()
@@ -1178,6 +1180,10 @@ def find_stimulation_pulses_auto(
     #     template_canvas[dest_slice_start : dest_slice_start + len_to_copy] = \
     #         template_dynamic[src_slice_start : src_slice_start + len_to_copy]
     # --- End Canvas Logic ---
+    
+    peak_offset_in_template = 0 # Initialize
+    if len(template_waveform) > 0:
+        peak_offset_in_template = np.argmax(np.abs(template_waveform))
 
     if debug_plots:
         # Plot 3: Final Template Waveform (Dynamic Segment)
@@ -1185,6 +1191,9 @@ def find_stimulation_pulses_auto(
         # Time axis for the dynamic template, centered
         dynamic_template_times = (np.arange(len(template_waveform)) - len(template_waveform)//2) / sfreq
         ax_template_plot.plot(dynamic_template_times, template_waveform, label='Final Template (Dynamic Segment)')
+        # Mark the prominent peak within the template
+        time_of_peak_in_template_plot = (peak_offset_in_template - (len(template_waveform) // 2)) / sfreq
+        ax_template_plot.axvline(time_of_peak_in_template_plot, color='lime', linestyle=':', linewidth=2, label=f'Prominent Peak in Template (New Effective Center)')
         ax_template_plot.set_title('Step 3: Final Template Waveform (Dynamic Segment)')
         ax_template_plot.legend()
 
@@ -1256,10 +1265,14 @@ def find_stimulation_pulses_auto(
         detected_pulse_centers = np.array(final_detected_pulse_centers_list) # Update with refined list
 
     # --- Calculate pulse start and end based on the (potentially refined) detected_pulse_centers ---
-    template_half_len = len(template_waveform) // 2
-    pulse_starts_samples = detected_pulse_centers - template_half_len
-    # Ensure pulse_ends_samples correctly reflects the full length of template_waveform
-    pulse_ends_samples = pulse_starts_samples + len(template_waveform)
+    # The peak_offset_in_template was calculated before the debug plot for Step 3
+    # If template_waveform is empty, peak_offset_in_template is 0, which is safe.
+    
+    pulse_starts_samples = detected_pulse_centers - peak_offset_in_template
+    # Ensure pulse_ends_samples correctly reflects the full length of template_waveform.
+    # The length of the artifact is still len(template_waveform).
+    pulse_ends_samples = pulse_starts_samples + len(template_waveform) 
+
 
     if debug_plots:
         # Plot 4: Matched Filter Output
@@ -1329,15 +1342,52 @@ def plot_template_and_overlaid_pulses(
     if pulse_starts_samples is not None and len(pulse_starts_samples) > 0 and \
        pulse_ends_samples is not None and len(pulse_starts_samples) == len(pulse_ends_samples):
         # Ensure pulse_ends_samples is also valid
-        
-        for i, (start_samp, end_samp) in enumerate(zip(pulse_starts_samples, pulse_ends_samples)):
-            start_time = start_samp / sfreq
-            end_time = end_samp / sfreq
-            
-            # Ensure start and end times are within the plot limits if necessary,
-            # though axvspan usually handles this okay.
-            label = 'Detected Pulse Artifacts' if i == 0 else '_nolegend_'
-            ax_signal.axvspan(start_time, end_time, color='salmon', alpha=0.4, label=label)
+
+        # Create a sorted list of all unique event points (starts and ends of pulses)
+        all_event_points = np.unique(np.concatenate((pulse_starts_samples, pulse_ends_samples)))
+        all_event_points.sort()
+
+        # Flags for legend entries
+        first_green_span = True
+        first_red_span = True
+
+        if len(all_event_points) > 1:
+            for i in range(len(all_event_points) - 1):
+                interval_start_sample = all_event_points[i]
+                interval_end_sample = all_event_points[i+1]
+
+                if interval_start_sample >= interval_end_sample: # Skip zero-duration or invalid intervals
+                    continue
+
+                # Determine how many original pulses cover the midpoint of this elementary interval
+                mid_point_sample = (interval_start_sample + interval_end_sample) / 2.0
+                overlap_count = 0
+                for k in range(len(pulse_starts_samples)):
+                    # A pulse k covers the midpoint if:
+                    # pulse_starts_samples[k] <= mid_point_sample < pulse_ends_samples[k]
+                    # Note: pulse_ends_samples is exclusive end for slicing, so use <
+                    if pulse_starts_samples[k] <= mid_point_sample and mid_point_sample < pulse_ends_samples[k]:
+                        overlap_count += 1
+                
+                # Convert interval samples to time for plotting
+                start_time = interval_start_sample / sfreq
+                end_time = interval_end_sample / sfreq
+
+                if overlap_count == 1:
+                    label = 'Detected Pulse Artifacts (No Overlap)' if first_green_span else '_nolegend_'
+                    ax_signal.axvspan(start_time, end_time, color='green', alpha=0.4, label=label)
+                    if first_green_span: first_green_span = False
+                elif overlap_count > 1:
+                    label = 'Overlapping Detected Artifacts' if first_red_span else '_nolegend_'
+                    ax_signal.axvspan(start_time, end_time, color='red', alpha=0.5, label=label)
+                    if first_red_span: first_red_span = False
+        else: # Fallback for very few event points (e.g., single pulse, no distinct intervals)
+            # This case might indicate an issue or a very simple scenario.
+            # For simplicity, plot all as green if this fallback is hit.
+            for i, (start_samp, end_samp) in enumerate(zip(pulse_starts_samples, pulse_ends_samples)):
+                start_time = start_samp / sfreq
+                end_time = end_samp / sfreq
+                ax_signal.axvspan(start_time, end_time, color='green', alpha=0.4, label='Detected Pulse Artifacts' if i == 0 else '_nolegend_')
 
     ax_signal.set_xlabel('Time (s)')
     ax_signal.set_ylabel('Amplitude')
