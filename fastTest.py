@@ -12,6 +12,14 @@ import matplotlib.gridspec as gridspec # For more control over subplots
 from mne.time_frequency import psd_array_multitaper
 from scipy.signal import find_peaks
 
+# --- Configuration Switch for Testing ---
+USE_DEFAULT_TEST_PATHS = True # Set to False to use file dialogs
+
+# --- Define Default Paths (EDIT THESE FOR YOUR SYSTEM) ---
+if USE_DEFAULT_TEST_PATHS:
+    DEFAULT_FIF_FILE_PATH = "/Users/aashray/Documents/ChangLab/RCS04_tr_103_eeg_raw.fif" # Replace with your actual .fif path
+    DEFAULT_NPZ_FILE_PATH = "/Users/aashray/Documents/ChangLab/RCS04_tr_103_eeg_raw_psds.npz" # Replace with your actual .npz path
+
 # --- 1. GUI to Select File (and get initial parameters) ---
 """
     Opens a GUI for the user to select a .fif file and loads it using MNE.
@@ -26,29 +34,39 @@ tk_root.withdraw()  # Hide the main window
     # MNE logs can be verbose, so we'll only show warnings and errors.
 mne.set_log_level('WARNING')
 
+if USE_DEFAULT_TEST_PATHS:
+    fif_file_path = DEFAULT_FIF_FILE_PATH
+    npz_file_path = DEFAULT_NPZ_FILE_PATH
+    print(f"--- USING DEFAULT TEST PATHS ---")
+    print(f"Default .fif file: {fif_file_path}")
+    print(f"Default .npz file: {npz_file_path}")
+    if not os.path.exists(fif_file_path):
+        print(f"Error: Default .fif file not found at '{fif_file_path}'. Please check the path or set USE_DEFAULT_TEST_PATHS to False.")
+        raise SystemExit
+    if not os.path.exists(npz_file_path):
+        print(f"Error: Default .npz file not found at '{npz_file_path}'. Please check the path or set USE_DEFAULT_TEST_PATHS to False.")
+        raise SystemExit
+else:
     # Step 1: Select the EEG .fif file (for metadata and raw data)
-fif_file_path = filedialog.askopenfilename(
-    title="Select the EEG .fif file (for raw data and metadata)",
-    filetypes=[("FIF files", "*.fif"), ("All files", "*.*")]
+    fif_file_path = filedialog.askopenfilename(
+        title="Select the EEG .fif file (for raw data and metadata)",
+        filetypes=[("FIF files", "*.fif"), ("All files", "*.*")]
+        )
+    if not fif_file_path:
+        print("No .fif file was selected. Exiting the program.")
+        raise SystemExit
+
+    # Step 2: Select the pre-calculated PSD .npz file
+    npz_file_path = filedialog.askopenfilename(
+        title="Select the pre-calculated PSD .npz file",
+        filetypes=[("NumPy archive files", "*.npz"), ("All files", "*.*")]
     )
-    
-if not fif_file_path:
-    print("No file was selected. Exiting the program.")
-    raise SystemExit
+    if not npz_file_path:
+        print("No .npz file was selected. Exiting the program.")
+        raise SystemExit
+
 print(f"Loading .fif file: {fif_file_path}")
 raw = mne.io.read_raw_fif(fif_file_path, preload=True)
-
-
-
-# Step 2: Select the pre-calculated PSD .npz file
-npz_file_path = filedialog.askopenfilename(
-    title="Select the pre-calculated PSD .npz file",
-    filetypes=[("NumPy archive files", "*.npz"), ("All files", "*.*")]
-)
-if not npz_file_path:
-    print("No .npz file was selected. Exiting the program.")
-    raise SystemExit
-
 
 print(f"Loading PSD data from: {npz_file_path}")
 
@@ -464,583 +482,18 @@ def determine_stim_epoch_boundaries(
     return epoch_start_time_s, epoch_end_time_s
 
 
-# --- 6. Template Matching for Stim Pulse Identification (inspired by old.py) ---
-def identify_stim_pulses_template_matching(
-    avg_signal,
-    sfreq,
-    stim_freq_hz,
-    template_half_width_as_factor_of_period, # New: e.g., 0.25 for a quarter period on each side
-    template_center_offset_as_factor_of_period, # New: e.g., 0.1 to shift window 10% of period earlier
-    num_pulses_for_template=15, # Increased default slightly
-    prioritize_sharper_spikes=True, # New: Flag to enable sharpness prioritization
-    scan_initial_window_for_sharpest_peak=True, # New: Scan initial part of signal for a seed peak
-    initial_scan_duration_factor=2.0, # New: e.g., 2.0 for 2/stim_freq_hz seconds
-    sharpness_window_samples=3, # New: Samples on each side of peak to calculate sharpness
-    initial_peak_prominence_factor=3.0, # Multiplier for std dev for initial threshold
-    initial_peak_dist_factor=0.8, # Factor of stim period for min_dist
-    mf_peak_percentile=80,
-    mf_peak_dist_factor=0.5 # Factor of stim period for distance
-):
-    """
-    Identifies stimulation pulses using template matching.
-
-    Args:
-        avg_signal (np.ndarray): Average signal across channels (1D).
-        sfreq (float): Sampling frequency in Hz.
-        stim_freq_hz (float): Estimated stimulation frequency in Hz.
-        
-        template_half_width_as_factor_of_period (float): Factor of the stimulation period
-            to determine the half-width of the template window. E.g., 0.5 means
-            the template half-width is 0.5 * stim_period.
-        template_center_offset_as_factor_of_period (float): Factor of the stimulation
-            period to offset the center of the template extraction window relative
-            to the detected peak. Positive values shift the window earlier.
-        num_pulses_for_template (int): Number of most prominent initial pulses to
-            average for creating the template.
-        prioritize_sharper_spikes (bool): If True, prioritizes sharper spikes (based on local
-            derivative) in addition to amplitude for template selection.
-        scan_initial_window_for_sharpest_peak (bool): If True, the function will scan an initial
-            window of the provided `avg_signal` (duration based on `initial_scan_duration_factor`)
-            to find the sharpest peak, which will be prioritized for template inclusion.
-        initial_scan_duration_factor (float): Multiplier for (1/stim_freq_hz) to define the duration
-            of the initial scan window. Only used if `scan_initial_window_for_sharpest_peak` is True.
-        sharpness_window_samples (int): Number of samples to look on each side of a peak
-            to calculate its sharpness. Only used if prioritize_sharper_spikes is True.
-        initial_peak_prominence_factor (float): Factor to multiply std dev by for
-            initial peak thresholding.
-        initial_peak_dist_factor (float): Factor of stimulation period for minimum
-            distance between initial peaks.
-        mf_peak_percentile (int): Percentile for matched-filter output peak
-            detection threshold.
-        mf_peak_dist_factor (float): Factor of stimulation period for minimum
-            distance between matched-filter peaks.
-
-    Returns:
-        tuple: (pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output)
-               Returns (None, None, None, None) if steps fail.
-    """
-    print(f"\n--- Identifying stimulation pulses using template matching (stim_freq: {stim_freq_hz:.2f} Hz) ---")
-
-    if stim_freq_hz <= 0:
-        print("Error: stim_freq_hz must be positive.")
-        return None, None, None, None
-    stim_period_s = 1.0 / stim_freq_hz
-
-    # 1. Template Window Sizing (New logic)
-    template_window_samples = int(template_half_width_as_factor_of_period * stim_period_s * sfreq)
-    if template_window_samples <= 0:
-        print(f"Warning: Calculated template_window_samples is {template_window_samples}. "
-              f"This might be due to small template_half_width_as_factor_of_period ({template_half_width_as_factor_of_period}) "
-              f"or low stim_freq_hz/sfreq. Setting to 1 sample.")
-        template_window_samples = 1 # Ensure a minimal valid window
-    template_total_len = 2 * template_window_samples
-    print(f"Template params: half-width={template_window_samples} samples, total_len={template_total_len} samples.")
-
-    # 2. Template Centering Offset (New logic)
-    template_center_offset_samples = int(template_center_offset_as_factor_of_period * stim_period_s * sfreq)
-    print(f"Template center offset: {template_center_offset_samples} samples (earlier).")
-
-    the_sharpest_seed_peak_idx = None
-    # --- Step 0 (New): Scan Initial Window for the Sharpest Peak (if enabled) ---
-    if scan_initial_window_for_sharpest_peak and stim_freq_hz > 0:
-        scan_duration_s = initial_scan_duration_factor / stim_freq_hz
-        scan_end_sample = min(int(scan_duration_s * sfreq), len(avg_signal))
-        print(f"Step 0: Scanning initial {scan_duration_s:.3f}s (up to sample {scan_end_sample}) of the provided signal for a sharp seed peak.")
-
-        if scan_end_sample > sharpness_window_samples * 2: # Ensure window is large enough for peak finding and sharpness
-            initial_signal_segment = avg_signal[:scan_end_sample]
-            # Looser threshold for initial scan to find candidates
-            scan_thresh = np.mean(np.abs(initial_signal_segment)) + 1.5 * np.std(np.abs(initial_signal_segment))
-            peaks_in_scan, _ = find_peaks(np.abs(initial_signal_segment), height=scan_thresh)
-
-            if len(peaks_in_scan) > 0:
-                scan_sharpness_scores = []
-                valid_scan_peaks = []
-                for p_idx_relative in peaks_in_scan:
-                    if p_idx_relative >= sharpness_window_samples and \
-                       p_idx_relative < len(initial_signal_segment) - sharpness_window_samples:
-                        sharpness = np.abs(initial_signal_segment[p_idx_relative] - initial_signal_segment[p_idx_relative - 1]) + \
-                                    np.abs(initial_signal_segment[p_idx_relative] - initial_signal_segment[p_idx_relative + 1])
-                        scan_sharpness_scores.append(sharpness)
-                        valid_scan_peaks.append(p_idx_relative)
-                
-                if scan_sharpness_scores:
-                    the_sharpest_seed_peak_idx = valid_scan_peaks[np.argmax(scan_sharpness_scores)]
-                    print(f"Sharpest seed peak in initial scan found at relative sample: {the_sharpest_seed_peak_idx} within the scanned segment.")
-                else:
-                    print("No valid peaks for sharpness calculation in the initial scan window of the signal.")
-            else:
-                print("No peaks found in the initial scan window of the signal.")
-        else:
-            print("Initial scan window too short based on signal length or sharpness_window_samples. Skipping initial scan.")
-
-
-    # --- Step 1: Initial rough detection of artifact starts (Original logic) ---
-
-    print("Step 1: Initial rough pulse detection...")
-    thresh_init = np.mean(np.abs(avg_signal)) + initial_peak_prominence_factor * np.std(np.abs(avg_signal))
-    min_dist_samples = int(initial_peak_dist_factor * (sfreq / stim_freq_hz))
-    
-    initial_peaks_indices, _ = find_peaks(np.abs(avg_signal), height=thresh_init, distance=min_dist_samples)
-    
-    if len(initial_peaks_indices) == 0:
-        print("No initial pulses found. Cannot proceed with template matching.")
-        return None, None, None, None
-    print(f"Found {len(initial_peaks_indices)} initial candidate pulses.")
-
-
-    # --- Step 2a: Selection of Prominent Pulses for Template (New logic) ---
-    print(f"Step 2a: Selecting up to {num_pulses_for_template} most prominent initial pulses for template...")
-    
-    selected_peak_indices_for_template_list = []
-
-    if len(initial_peaks_indices) > 0:
-        if prioritize_sharper_spikes or the_sharpest_seed_peak_idx is not None:
-            # Calculate scores for all initial_peaks_indices
-            sharpness_scores = []
-            peak_amplitudes_for_scoring = []
-            valid_initial_peaks = []
-
-            for p_idx in initial_peaks_indices:
-                # Ensure we are within bounds for sharpness calculation
-                if p_idx >= sharpness_window_samples and p_idx < len(avg_signal) - sharpness_window_samples:
-                    # Or, sum of absolute differences to immediate neighbors:
-                    sharpness = np.abs(avg_signal[p_idx] - avg_signal[p_idx - 1]) + \
-                                np.abs(avg_signal[p_idx] - avg_signal[p_idx + 1])
-                    sharpness_scores.append(sharpness)
-                    peak_amplitudes_for_scoring.append(np.abs(avg_signal[p_idx]))
-                    valid_initial_peaks.append(p_idx)
-            
-            if not valid_initial_peaks: # Fallback if no peaks allow sharpness calculation
-                print("Warning: Could not calculate sharpness for any initial peaks for general selection. Falling back to amplitude only for general selection.")
-                peak_amplitudes = np.abs(avg_signal[initial_peaks_indices])
-                combined_scores = peak_amplitudes
-                peaks_to_score = initial_peaks_indices
-            else:
-                if prioritize_sharper_spikes:
-                    print("Prioritizing sharper spikes for general template selection.")
-                    combined_scores = np.array(peak_amplitudes_for_scoring) * np.array(sharpness_scores)
-                else: # Only amplitude if prioritize_sharper_spikes is false but seed peak was found
-                    combined_scores = np.array(peak_amplitudes_for_scoring)
-                peaks_to_score = np.array(valid_initial_peaks)
-        else: # Original logic if not prioritizing sharpness and no seed peak
-            combined_scores = np.abs(avg_signal[initial_peaks_indices])
-            peaks_to_score = initial_peaks_indices
-
-        sorted_score_indices = np.argsort(combined_scores)[::-1]
-
-        # Prioritize the sharpest seed peak if found
-        if the_sharpest_seed_peak_idx is not None:
-            if the_sharpest_seed_peak_idx in peaks_to_score: # Check if it's among the scorable peaks
-                selected_peak_indices_for_template_list.append(the_sharpest_seed_peak_idx)
-                print(f"Added sharpest seed peak (sample {the_sharpest_seed_peak_idx}) to template list.")
-            else:
-                # This might happen if the seed peak was filtered out by initial_peak_dist_factor
-                # or other criteria of the main find_peaks. Consider if this is acceptable.
-                print(f"Warning: Sharpest seed peak (sample {the_sharpest_seed_peak_idx}) was not in the list of scorable initial peaks. Not adding it.")
-
-        # Fill remaining slots
-        num_needed = num_pulses_for_template - len(selected_peak_indices_for_template_list)
-        for scored_idx in sorted_score_indices:
-            peak = peaks_to_score[scored_idx]
-            if num_needed <= 0: break
-            if peak not in selected_peak_indices_for_template_list: # Avoid duplicates
-                selected_peak_indices_for_template_list.append(peak)
-                num_needed -= 1
-        selected_peak_indices_for_template = np.array(selected_peak_indices_for_template_list)
-    else:
-        # This case should not be reached due to the check above, but for safety:
-        selected_peak_indices_for_template = np.array([], dtype=int)
-
-    if len(selected_peak_indices_for_template) == 0:
-        print("No initial pulses selected for template creation (e.g., num_pulses_for_template might be 0 or no initial pulses found).")
-        return None, None, None, None
-    print(f"Selected {len(selected_peak_indices_for_template)} pulses to build template.")
-
-    # --- Step 2b: Template Snippet Extraction and Averaging (New logic) ---
-    print(f"Step 2b: Building template from selected pulses...")
-    snippets = []
-    
-    # Define a slightly wider window for finding the true peak within each snippet
-    # This helps ensure the template_window_samples captures the main morphology
-    # even if the initial peak_idx isn't perfectly at the max of the artifact.
-    extraction_half_width_for_true_peak = template_window_samples + sharpness_window_samples # Or some other reasonable extension
-
-    for peak_idx in selected_peak_indices_for_template:
-        # Initial center for extracting a wider snippet, adjusted by the general offset
-        initial_extraction_center = peak_idx - template_center_offset_samples
-
-        # Extract a wider snippet to find the true local peak
-        wide_snippet_start = max(0, initial_extraction_center - extraction_half_width_for_true_peak)
-        wide_snippet_end = min(len(avg_signal), initial_extraction_center + extraction_half_width_for_true_peak)
-        wide_snippet = avg_signal[wide_snippet_start:wide_snippet_end]
-
-        if len(wide_snippet) == 0:
-            continue # Should not happen if peak_idx is valid
-
-        # Find the index of the maximum absolute value within this wide snippet
-        true_peak_in_wide_snippet_idx = np.argmax(np.abs(wide_snippet))
-        # This is the refined center for the final template snippet
-        final_extraction_center = wide_snippet_start + true_peak_in_wide_snippet_idx
-        
-        # Desired start and end of the *final* template snippet in avg_signal coordinates
-        desired_start_in_signal = final_extraction_center - template_window_samples
-        desired_end_in_signal = final_extraction_center + template_window_samples # Exclusive end for slicing
-
-        # Create an empty snippet of the required total length, filled with zeros
-        current_snippet = np.zeros(template_total_len)
-
-        # Determine the actual part of avg_signal to copy
-        src_start_in_avg_signal = max(0, desired_start_in_signal)
-        src_end_in_avg_signal = min(len(avg_signal), desired_end_in_signal)
-        
-        # Segment from avg_signal to be copied
-        avg_signal_segment_to_copy = avg_signal[src_start_in_avg_signal:src_end_in_avg_signal]
-        len_segment_to_copy = len(avg_signal_segment_to_copy)
-
-        if len_segment_to_copy > 0:
-            # Determine where in `current_snippet` this data should be placed
-            dest_start_in_snippet = max(0, -desired_start_in_signal)
-            dest_end_in_snippet = dest_start_in_snippet + len_segment_to_copy
-            
-            if dest_end_in_snippet <= template_total_len:
-                current_snippet[dest_start_in_snippet:dest_end_in_snippet] = avg_signal_segment_to_copy
-            else:
-                # This should not happen if logic is correct and template_total_len is sufficient
-                # It implies the segment to copy is too large for the destination slot
-                print(f"Warning: Snippet for peak_idx {peak_idx} had inconsistent lengths. "
-                      f"dest_end_in_snippet ({dest_end_in_snippet}) > template_total_len ({template_total_len}). Skipping this snippet part.")
-        
-        snippets.append(current_snippet)
-
-    if not snippets:
-        print("No valid snippets collected for template creation.") # Should be caught earlier
-        return None, None, None, None
-        
-    template_waveform = np.mean(snippets, axis=0)
-    if np.all(template_waveform == 0):
-        print("Warning: Template is all zeros. Check initial pulse detection, selection, sharpness metric, or signal quality.")
-        # Depending on requirements, you might return here or allow to proceed
-
-    # --- Step 3: Matched filter (Original logic) ---
-    print("Step 3: Applying matched filter...")
-    if len(template_waveform) == 0: # Should not happen if template_total_len > 0
-        print("Error: Template waveform is empty.")
-        return None, None, None, None
-    mf_kernel = template_waveform[::-1]
-    matched_filter_output = np.convolve(avg_signal, mf_kernel, mode='same')
-
-    # --- Step 4: Detect peaks in matched-filter output (Original logic) ---
-    print("Step 4: Detecting peaks in matched-filter output...")
-    stim_period_samples = sfreq / stim_freq_hz # recalculate for clarity or use stim_period_s * sfreq
-    mf_peak_threshold = np.percentile(matched_filter_output, mf_peak_percentile)
-    mf_distance_samples = int(mf_peak_dist_factor * stim_period_samples)
-    
-    # These are the centers of the detected template matches
-    detected_pulse_centers, _ = find_peaks(
-        matched_filter_output,
-        height=mf_peak_threshold,
-        distance=mf_distance_samples
-    )
-
-    if len(detected_pulse_centers) == 0:
-        print("No pulses found after matched filtering.")
-        return detected_pulse_centers, None, template_waveform, matched_filter_output
-
-    # Adjust detected pulse centers to define start and end of the artifact window
-    # The detected_pulse_centers are where the center of the kernel (reversed template) aligns for a peak.
-    # template_window_samples is the half-length of the template.
-    # template_total_len is the full length of the template.
-    
-    pulse_starts_samples = [max(0, center - template_window_samples) for center in detected_pulse_centers]
-    pulse_ends_samples = [min(len(avg_signal) - 1, start + template_total_len - 1) for start in pulse_starts_samples]
-
-
-    print(f"Identified {len(pulse_starts_samples)} stimulation pulses via template matching.")
-    return pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output
-
-
-# --- 6b. Template Matching V2 (for complex, multi-spike artifacts) ---
-def identify_stim_pulses_template_matching_v2(
-    avg_signal,
-    sfreq,
-    stim_freq_hz,
-    template_start_ms_before_peak=5.0, # NEW: How many ms to look BACK from the detected peak ## how many samples I think actually!!!
-    template_end_ms_after_peak=5.0,   # NEW: How many ms to look FORWARD from the detected peak
-    num_pulses_for_template=20,
-    initial_peak_prominence_factor=2.5, # Adjusted default
-    initial_peak_dist_factor=0.8,
-    mf_peak_percentile=85, # Adjusted default
-    mf_peak_dist_factor=0.5
-):
-    """
-    Identifies stimulation pulses using template matching, specifically designed for
-    complex, multi-peak artifacts by using an ASYMMETRIC window.
-
-    Instead of a symmetric half-width, this function defines the template window
-    based on milliseconds before and after the detected primary peak.
-
-    Args:
-        avg_signal (np.ndarray): Average signal across channels (1D).
-        sfreq (float): Sampling frequency in Hz.
-        stim_freq_hz (float): Estimated stimulation frequency in Hz.
-        template_start_ms_before_peak (float): The duration in milliseconds to include
-            in the template BEFORE the detected peak. Crucial for capturing leading spikes.
-        template_end_ms_after_peak (float): The duration in milliseconds to include
-            in the template AFTER the detected peak.
-        num_pulses_for_template (int): Number of most prominent initial pulses to
-            average for creating the template.
-        initial_peak_prominence_factor (float): Factor to multiply std dev by for
-            initial peak thresholding.
-        initial_peak_dist_factor (float): Factor of stimulation period for minimum
-            distance between initial peaks.
-        mf_peak_percentile (int): Percentile for matched-filter output peak
-            detection threshold.
-        mf_peak_dist_factor (float): Factor of stimulation period for minimum
-            distance between matched-filter peaks.
-
-    Returns:
-        tuple: (pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output)
-    """
-    print(f"\n--- Identifying complex stimulation pulses using Template Matching V2 (stim_freq: {stim_freq_hz:.2f} Hz) ---")
-
-    if stim_freq_hz <= 0:
-        print("Error: stim_freq_hz must be positive.")
-        return None, None, None, None
-
-    # 1. Convert MS-based window to samples
-    samples_before_peak = int((template_start_ms_before_peak / 1000.0) * sfreq)
-    samples_after_peak = int((template_end_ms_after_peak / 1000.0) * sfreq)
-    template_total_len = samples_before_peak + samples_after_peak
-    
-    if template_total_len <= 0:
-        print("Error: Template length is zero. Check template window parameters.")
-        return None, None, None, None
-    
-    print(f"Template Window: {samples_before_peak} samples before peak, {samples_after_peak} samples after.")
-    print(f"Total template length: {template_total_len} samples.")
-
-
-    # 2. Initial rough detection of the LARGEST spike in each artifact complex
-    print("Step 1: Initial rough pulse detection (finding primary peak of each complex)...")
-    thresh_init = np.mean(np.abs(avg_signal)) + initial_peak_prominence_factor * np.std(np.abs(avg_signal))
-    min_dist_samples = int(initial_peak_dist_factor * (sfreq / stim_freq_hz))
-    
-    # We search on the absolute signal to robustly find the main peak regardless of polarity
-    initial_peaks_indices, _ = find_peaks(np.abs(avg_signal), height=thresh_init, distance=min_dist_samples)
-    
-    if len(initial_peaks_indices) == 0:
-        print("No initial pulses found. Cannot proceed. Try lowering 'initial_peak_prominence_factor'.")
-        return None, None, None, None
-    print(f"Found {len(initial_peaks_indices)} initial candidate pulses.")
-
-    # 3. Select the most prominent pulses to build the template
-    print(f"Step 2: Selecting up to {num_pulses_for_template} most prominent pulses for template...")
-    if len(initial_peaks_indices) > num_pulses_for_template:
-        # Sort by amplitude and take the top N
-        peak_amplitudes = np.abs(avg_signal[initial_peaks_indices])
-        strongest_peak_indices = np.argsort(peak_amplitudes)[::-1][:num_pulses_for_template]
-        selected_peak_indices_for_template = initial_peaks_indices[strongest_peak_indices]
-    else:
-        selected_peak_indices_for_template = initial_peaks_indices
-    
-    print(f"Selected {len(selected_peak_indices_for_template)} pulses to build template.")
-
-    # 4. Build the template using the ASYMMETRIC window
-    print(f"Step 3: Building template from selected pulses...")
-    snippets = []
-    for peak_idx in selected_peak_indices_for_template:
-        # Define the start and end of the asymmetric window
-        window_start = peak_idx - samples_before_peak
-        window_end = peak_idx + samples_after_peak
-
-        # Handle edges of the signal gracefully by padding with zeros
-        snippet = np.zeros(template_total_len)
-        
-        # Determine the source segment from the actual signal
-        src_start = max(0, window_start)
-        src_end = min(len(avg_signal), window_end)
-        
-        # Determine the destination segment in our snippet array
-        dest_start = max(0, -window_start)
-        dest_end = dest_start + (src_end - src_start)
-        
-        if dest_end > template_total_len:
-            # This can happen if the last snippet goes past the array boundary
-            # and our calculation overflows. We trim it.
-            dest_end = template_total_len
-            src_end = src_start + (dest_end - dest_start)
-
-        # Copy the data
-        if dest_start < dest_end:
-             snippet[dest_start:dest_end] = avg_signal[src_start:src_end]
-
-        snippets.append(snippet)
-
-    if not snippets:
-        print("No valid snippets collected.")
-        return None, None, None, None
-        
-    template_waveform = np.mean(snippets, axis=0)
-    
-    # 5. Matched filter
-    print("Step 4: Applying matched filter...")
-    mf_kernel = template_waveform[::-1]
-    matched_filter_output = np.convolve(avg_signal, mf_kernel, mode='same')
-
-    # 6. Detect peaks in matched-filter output
-    print("Step 5: Detecting final peaks in matched-filter output...")
-    stim_period_samples = sfreq / stim_freq_hz
-    mf_peak_threshold = np.percentile(matched_filter_output, mf_peak_percentile)
-    mf_distance_samples = int(mf_peak_dist_factor * stim_period_samples)
-    
-    detected_pulse_centers, _ = find_peaks(
-        matched_filter_output,
-        height=mf_peak_threshold,
-        distance=mf_distance_samples
-    )
-
-    if len(detected_pulse_centers) == 0:
-        print("No pulses found after matched filtering. Try lowering 'mf_peak_percentile'.")
-        return None, None, template_waveform, matched_filter_output
-
-    # The 'start' of the pulse corresponds to the beginning of our template window.
-    # The detected center corresponds to the location of the primary peak used for anchoring.
-    pulse_starts_samples = detected_pulse_centers - samples_before_peak
-    pulse_ends_samples = detected_pulse_centers + samples_after_peak
-
-    print(f"Identified {len(pulse_starts_samples)} stimulation pulses via template matching.")
-    return pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output
-
-
-# --- 6c. Template Matching V3 (Spikiest Peak at Epoch Onset) ---
-def identify_stim_pulses_template_matching_v3(
-    avg_signal_epoch,
-    sfreq,
-    stim_freq_hz,
-    template_start_ms_before_peak=7.0,
-    template_end_ms_after_peak=7.0,
-    seed_search_duration_factor=2.0,
-    sharpness_search_prominence=1.5
-):
-    """
-    Identifies stimulation pulses by creating a template from a SINGLE, "spikiest"
-    peak found at the very beginning of the provided signal (epoch).
-
-    Args:
-        avg_signal_epoch (np.ndarray): The signal segment corresponding to the
-            stimulation epoch. The search for the spiky peak will start from index 0.
-        sfreq (float): Sampling frequency in Hz.
-        stim_freq_hz (float): Estimated stimulation frequency in Hz.
-        template_start_ms_before_peak (float): Duration in ms to include in the
-            template BEFORE the spikiest peak.
-        template_end_ms_after_peak (float): Duration in ms to include in the
-            template AFTER the spikiest peak.
-        seed_search_duration_factor (float): Multiplier for the stimulation period
-            (1/stim_freq_hz) to define the search window duration.
-            Default of 2.0 means it searches in the first 2/stim_freq_hz seconds.
-        sharpness_search_prominence (float): The prominence factor (multiplier of std dev)
-            to find candidate peaks for the sharpness test.
-
-    Returns:
-        tuple: (pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output)
-    """
-    print(f"\n--- Template Matching V3: Finding spikiest peak at epoch onset (stim_freq: {stim_freq_hz:.2f} Hz) ---")
-
-    # --- Step 1: Find the "spikiest" peak in the initial part of the epoch ---
-    search_duration_s = seed_search_duration_factor / stim_freq_hz
-    search_end_sample = min(int(search_duration_s * sfreq), len(avg_signal_epoch))
-    
-    print(f"Searching for spikiest peak in the first {search_duration_s:.3f}s (up to sample {search_end_sample}) of the epoch.")
-    
-    search_segment = avg_signal_epoch[:search_end_sample]
-
-    if len(search_segment) < 3: # Need at least 3 samples to find a peak
-        print("Epoch segment too short to find a seed peak. Cannot proceed.")
-        return None, None, None, None
-
-    # Find all candidate peaks in this initial window
-    thresh = np.mean(np.abs(search_segment)) + sharpness_search_prominence * np.std(np.abs(search_segment))
-    candidate_peaks, _ = find_peaks(np.abs(search_segment), height=thresh)
-
-    if len(candidate_peaks) == 0:
-        print(f"No candidate peaks found in the initial search window. Try lowering 'sharpness_search_prominence'.")
-        return None, None, None, None
-
-    # Calculate sharpness for each candidate and find the spikiest
-    max_sharpness = -1
-    spikiest_peak_idx = -1
-
-    for p_idx in candidate_peaks:
-        # Ensure the peak is not at the very edge to allow sharpness calculation
-        if 1 <= p_idx < len(search_segment) - 1:
-            # Sharpness = sum of absolute slopes on either side of the peak
-            sharpness = np.abs(search_segment[p_idx] - search_segment[p_idx - 1]) + \
-                        np.abs(search_segment[p_idx] - search_segment[p_idx + 1])
-            if sharpness > max_sharpness:
-                max_sharpness = sharpness
-                spikiest_peak_idx = p_idx
-
-    if spikiest_peak_idx == -1:
-        print("Could not determine a spikiest peak (e.g., all candidates were at the signal edge).")
-        return None, None, None, None
-
-    print(f"Found spikiest seed peak at sample {spikiest_peak_idx} within the epoch.")
-
-    # --- Step 2: Build the template from this single peak ---
-    print("Step 2: Building template from the single spikiest peak...")
-    samples_before_peak = int((template_start_ms_before_peak / 1000.0) * sfreq)
-    samples_after_peak = int((template_end_ms_after_peak / 1000.0) * sfreq)
-    template_total_len = samples_before_peak + samples_after_peak
-
-    window_start = spikiest_peak_idx - samples_before_peak
-    window_end = spikiest_peak_idx + samples_after_peak
-    
-    # Extract the snippet, padding with zeros at the edges
-    template_waveform = np.zeros(template_total_len)
-    src_start = max(0, window_start)
-    src_end = min(len(avg_signal_epoch), window_end)
-    dest_start = max(0, -window_start)
-    dest_end = dest_start + (src_end - src_start)
-    
-    if dest_start < dest_end:
-        template_waveform[dest_start:dest_end] = avg_signal_epoch[src_start:src_end]
-
-    # --- Step 3: Apply Matched Filter and Detect All Pulses ---
-    print("Step 3: Applying matched filter across the entire epoch...")
-    mf_kernel = template_waveform[::-1]
-    matched_filter_output = np.convolve(avg_signal_epoch, mf_kernel, mode='same')
-
-    print("Step 4: Detecting final peaks...")
-    stim_period_samples = sfreq / stim_freq_hz
-    mf_peak_percentile = 85 # A good starting point
-    mf_distance_samples = int(0.5 * stim_period_samples) # 50% of period to avoid double detection
-    mf_peak_threshold = np.percentile(matched_filter_output, mf_peak_percentile)
-    
-    detected_pulse_centers, _ = find_peaks(
-        matched_filter_output,
-        height=mf_peak_threshold,
-        distance=mf_distance_samples
-    )
-
-    if len(detected_pulse_centers) == 0:
-        print("No pulses found after matched filtering.")
-        return None, None, template_waveform, matched_filter_output
-
-    pulse_starts_samples = detected_pulse_centers - samples_before_peak
-    pulse_ends_samples = detected_pulse_centers + samples_after_peak
-
-    print(f"Identified {len(pulse_starts_samples)} stimulation pulses.")
-    return pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output
 
 # --- 6. Fully Automatic Pulse Identification Function ---
 def find_stimulation_pulses_auto(
     avg_signal_epoch,
     sfreq,
     stim_freq_hz,
-    template_half_width_ms=7.0, # New: Half-width of template in ms (e.g., 7ms before and 7ms after peak)
     debug_plots=False 
 ):
+    # User wants total template length = 1 / (4 * stim_freq_hz) seconds.
+    # So, template_half_width_s = (1 / (4 * stim_freq_hz)) / 2 = 1 / (8 * stim_freq_hz) seconds.
+    template_half_width_s = 1.0 / (8.0 * stim_freq_hz) 
+
     """
     Automatically detects stimulation pulses with varying numbers of components
     without requiring manual parameter tuning for the template shape.
@@ -1058,78 +511,65 @@ def find_stimulation_pulses_auto(
         stim_freq_hz (float): Estimated stimulation frequency.
         debug_plots (bool): If True, will generate a plot showing intermediate
                             steps of the automatic detection process.        
-        template_half_width_ms (float): The half-width of the template extraction window
-                                     in milliseconds, centered on the seed peak.
+        (Note: template_half_width_s is now calculated internally based on stim_freq_hz
+         to achieve a total template length of 1/(4*stim_freq_hz) seconds)
 
     Returns:
-        tuple: (pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output)
+        tuple: (pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output, seed_peak_location_relative_to_epoch)
     """
     print("\n--- Running Fully Automatic Pulse Detection ---")
 
     # --- Step 1: Find a single "spiky" seed peak to anchor our analysis ---
     if stim_freq_hz <= 0:
         print("Automatic Strategy: stim_freq_hz must be positive.")
-        return None, None, None, None
+        return None, None, None, None, None
         
-
-    search_duration_s = 2.0 / stim_freq_hz
+    # Define the search duration for the initial seed peak: +/- (1/2 * stim_freq_hz) around epoch start
+    # This means the window width is 1 / (2 * stim_freq_hz)
+    search_duration_s = 1.0 / (stim_freq_hz) ## change this if wanted
     search_end_sample = min(int(search_duration_s * sfreq), len(avg_signal_epoch))
     search_segment = avg_signal_epoch[:search_end_sample]
 
     if len(search_segment) < 3:
         print("Automatic Strategy: Epoch segment too short to find a seed peak.")
-        return None, None, None, None
+        return None, None, None, None, None
 
-    # Find candidate peaks based on their height in the absolute signal
-    # Using median and std for a robust threshold against outliers in the segment
-    # Calculate the threshold first
-    height_threshold_seed = np.median(np.abs(search_segment)) + 2.0 * np.std(np.abs(search_segment))
-
-    # --- TEMPORARY DEBUG PLOT ---
-    if debug_plots: # Only plot if debug_plots is True
-        # import matplotlib.pyplot as plt # Already imported at the top of the file
-        plt.figure(figsize=(12, 6))
-        plt.title(f"Debug: search_segment for Seed Peak (first {search_duration_s:.3f}s of epoch)")
-        time_axis_search_segment = np.arange(len(search_segment)) / sfreq
-        plt.plot(time_axis_search_segment, search_segment, label=f'search_segment (raw)')
-        plt.plot(time_axis_search_segment, np.abs(search_segment), label='np.abs(search_segment)', linestyle='--')
-        plt.axhline(height_threshold_seed, color='r', linestyle=':', label=f'height_threshold_seed ({height_threshold_seed:.2f})')
-        plt.xlabel("Time in search_segment (s)")
-        plt.ylabel("Amplitude")
-        plt.legend()
-        plt.show() # Show this plot immediately to diagnose
-
-    candidate_peaks_indices, _ = find_peaks(np.abs(search_segment), height=height_threshold_seed)
+    # Find all candidate peaks in the absolute signal of the search_segment.
+    # We will select the most prominent POSITIVE peak.
+    # A minimal prominence might be useful to avoid picking up noise if the segment is flat,
+    # We'll use a very small prominence value for find_peaks to get candidates,
+    # and then select the one with the maximum calculated prominence.
+    candidate_peaks_indices, properties = find_peaks(search_segment, prominence=1e-9) # Operate on original signal to find positive peaks
     
+    # The main debug plot (if enabled) will show the seed peak selection in its first panel.
     if not candidate_peaks_indices.any():
-        print(f"Automatic Strategy: No candidate seed peaks found with height > {height_threshold_seed:.2f} in the initial search segment.")
-        return None, None, None, None
+        print(f"Automatic Strategy: No candidate POSITIVE seed peaks found in the initial search segment (length {len(search_segment)} samples).")
+        return None, None, None, None, None
 
     # Filter out peaks at the very edges of the search_segment
     # A peak at index 0 or len(search_segment)-1 is an edge peak.
     # We require peaks to have at least one sample on either side within the search_segment.
     non_edge_mask = (candidate_peaks_indices > 0) & (candidate_peaks_indices < len(search_segment) - 1)
     candidate_peaks_indices_filtered = candidate_peaks_indices[non_edge_mask]
+    candidate_prominences_filtered = properties["prominences"][non_edge_mask]
 
     if not candidate_peaks_indices_filtered.any():
-        print(f"Automatic Strategy: All candidate peaks found were at the edges of the search segment ({len(search_segment)} samples long). No valid non-edge seed peak found.")
+        print(f"Automatic Strategy: All candidate POSITIVE peaks found were at the edges of the search segment ({len(search_segment)} samples long). No valid non-edge seed peak found.")
         # Optionally, you could plot the search_segment here if debug_plots is True to see why
-        return None, None, None, None
+        return None, None, None, None, None
         
-    # Select the candidate peak that has the largest absolute amplitude in the original (not absolute) search_segment
-    # Use the filtered list of candidates
-    peak_amplitudes_at_candidates = np.abs(search_segment[candidate_peaks_indices_filtered])
-    
-    if not peak_amplitudes_at_candidates.any(): # Should not happen if candidate_peaks_indices is not empty
-        print("Automatic Strategy: Could not get amplitudes for filtered candidate peaks.") # Should be caught by previous check
-        return None, None, None, None
+    # Select the candidate peak that has the largest prominence value
+    if not candidate_prominences_filtered.any(): # Should be caught by the check above
+        print("Automatic Strategy: No prominences available for filtered candidate POSITIVE peaks.")
+        return None, None, None, None, None
 
-    idx_of_max_amplitude_in_candidates = np.argmax(peak_amplitudes_at_candidates)
+    idx_of_max_prominence_in_candidates = np.argmax(candidate_prominences_filtered)
     # Get the actual sample index in search_segment (and thus avg_signal_epoch)
-    seed_peak_location = candidate_peaks_indices_filtered[idx_of_max_amplitude_in_candidates]
+    seed_peak_location = candidate_peaks_indices_filtered[idx_of_max_prominence_in_candidates]
+    selected_peak_prominence = candidate_prominences_filtered[idx_of_max_prominence_in_candidates]
     
-    print(f"Found seed peak (max amplitude in initial {search_duration_s:.3f}s segment) at sample {seed_peak_location} "
-          f"(value: {search_segment[seed_peak_location]:.2f}, abs value: {np.abs(search_segment[seed_peak_location]):.2f}).")
+    print(f"Found POSITIVE seed peak (max prominence in initial {search_duration_s:.3f}s segment) at sample {seed_peak_location} "
+          f"(prominence: {selected_peak_prominence:.2f}, value: {search_segment[seed_peak_location]:.2f}).")
 
     if debug_plots:
         plt.figure(figsize=(15, 8)) # Adjusted for 3 plots now
@@ -1146,13 +586,13 @@ def find_stimulation_pulses_auto(
         ax_seed.legend()
 
     # --- Step 2: Extract Template based on seed_peak_location and fixed window ---
-    samples_before_peak = int((template_half_width_ms / 1000.0) * sfreq)
+    samples_before_peak = int(template_half_width_s * sfreq)
     samples_after_peak = samples_before_peak # Symmetric window
     template_total_len = samples_before_peak + samples_after_peak
 
     if template_total_len <= 0:
-        print(f"Automatic Strategy: Template total length is {template_total_len}. Check template_half_width_ms.")
-        return None, None, None, None
+        print(f"Automatic Strategy: Template total length is {template_total_len}. Check stim_freq_hz ({stim_freq_hz:.2f} Hz) and sfreq ({sfreq:.2f} Hz).")
+        return None, None, None, None, seed_peak_location # Return seed_peak_location even on failure for potential debugging
 
     # Define window in avg_signal_epoch coordinates
     window_start_abs = seed_peak_location - samples_before_peak
@@ -1172,7 +612,7 @@ def find_stimulation_pulses_auto(
     if dest_start_in_template < dest_end_in_template and dest_end_in_template <= template_total_len:
         template_waveform[dest_start_in_template:dest_end_in_template] = avg_signal_epoch[src_start_in_epoch:src_end_in_epoch]
     
-    print(f"Extracted template of length {len(template_waveform)} samples around seed peak (window: +/- {template_half_width_ms} ms).")
+    print(f"Extracted template of length {len(template_waveform)} samples around seed peak (window: +/- {template_half_width_s * 1000:.2f} ms).")
 
     period_samples = int(sfreq / stim_freq_hz)
     
@@ -1185,7 +625,7 @@ def find_stimulation_pulses_auto(
         ax_template_plot = plt.subplot(3, 1, 2) # Now subplot 2 of 3
         # Time axis for the dynamic template, centered
         dynamic_template_times = (np.arange(len(template_waveform)) - len(template_waveform)//2) / sfreq
-        ax_template_plot.plot(dynamic_template_times, template_waveform, label=f'Final Template (Window: +/- {template_half_width_ms} ms)')
+        ax_template_plot.plot(dynamic_template_times, template_waveform, label=f'Final Template (Window: +/- {template_half_width_s * 1000:.2f} ms)')
         # Mark the prominent peak within the template
         time_of_peak_in_template_plot = (peak_offset_in_template - (len(template_waveform) // 2)) / sfreq
         ax_template_plot.axvline(time_of_peak_in_template_plot, color='lime', linestyle=':', linewidth=2, label=f'Prominent Peak in Template (New Effective Center)')
@@ -1206,7 +646,7 @@ def find_stimulation_pulses_auto(
 
     if not detected_pulse_centers.size > 0: # Check if array is not empty
         print("Automatic Strategy: No pulses found after matched filtering (initial pass).")
-        return None, None, template_waveform, matched_filter_output
+        return None, None, template_waveform, matched_filter_output, seed_peak_location
 
     # --- New logic: Refine the first pulse based on seed_peak_location and leeway ---
     print(f"Automatic Strategy: Initial detection found {len(detected_pulse_centers)} pulses. Refining first pulse...")
@@ -1236,7 +676,7 @@ def find_stimulation_pulses_auto(
               f"leeway (samples: {expected_first_pulse_min_idx}-{expected_first_pulse_max_idx}) "
               f"around the seed peak (sample {seed_peak_location}). No pulses will be reported.")
         # If no pulse is within the leeway of the seed, we consider the condition for the first pulse not met.
-        return None, None, template_waveform, matched_filter_output
+        return None, None, template_waveform, matched_filter_output, seed_peak_location
     else:
         # Select the best candidate from the leeway window: the one with the highest matched filter output value
         confirmed_first_pulse_center = -1
@@ -1283,7 +723,7 @@ def find_stimulation_pulses_auto(
         # plt.show() # Removed: will be called once in main
 
     print(f"Identified {len(pulse_starts_samples)} stimulation pulses automatically.")
-    return pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output
+    return pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output, seed_peak_location
 
 
 # --- Plotting function for pulse identification results ---
@@ -1296,7 +736,8 @@ def plot_template_and_overlaid_pulses(
     sfreq,                # Sampling frequency
     mean_signal_overall=None, # Default argument moved later
     channel_name="Signal",# Name of the signal being plotted
-    stim_freq_hz=None     # Estimated stimulation frequency (for title)
+    stim_freq_hz=None,    # Estimated stimulation frequency (for title)
+    seed_peak_abs_sample=None # Absolute sample index of the seed peak
 ):
     """
     Visualizes the derived template and the detected pulses overlaid on the time series.
@@ -1383,6 +824,11 @@ def plot_template_and_overlaid_pulses(
                 start_time = start_samp / sfreq
                 end_time = end_samp / sfreq
                 ax_signal.axvspan(start_time, end_time, color='green', alpha=0.4, label='Detected Pulse Artifacts' if i == 0 else '_nolegend_')
+
+    # Plot the seed peak location if provided
+    if seed_peak_abs_sample is not None:
+        seed_peak_time = seed_peak_abs_sample / sfreq
+        ax_signal.plot(seed_peak_time, signal_to_plot[seed_peak_abs_sample], 'm*', markersize=12, label=f'Initial Seed Peak ({seed_peak_time:.3f}s)')
 
     ax_signal.set_xlabel('Time (s)')
     ax_signal.set_ylabel('Amplitude')
@@ -1554,21 +1000,23 @@ if __name__ == '__main__':
             
             if len(signal_for_template) > 0:
                 # Call the final, automatic function.
-                pulse_starts_rel, pulse_ends_rel, template, mf_out = find_stimulation_pulses_auto(
+                pulse_starts_rel, pulse_ends_rel, template, mf_out, seed_peak_rel = find_stimulation_pulses_auto(
                     avg_signal_epoch=signal_for_template,
                     sfreq=sampleRate,
                     stim_freq_hz=final_est_stim_freq,
-                    debug_plots=True # <<< Enable debug plots here
+                    debug_plots=USE_DEFAULT_TEST_PATHS # Automatically enable debug plots if using default paths
                 )
 
                 # 5. Plot the Final Results
                 # Initialize plot variables to safe defaults
                 pulse_starts_abs, pulse_ends_abs = None, None # Add pulse_ends_abs back
                 current_template_for_plot = np.array([]) # Ensure it's an empty array, not None
+                seed_peak_abs_for_plot = None
 
                 if pulse_starts_rel is not None and len(pulse_starts_rel) > 0:
                     pulse_starts_abs = np.array(pulse_starts_rel) + offset_samples
                     pulse_ends_abs = np.array(pulse_ends_rel) + offset_samples
+                    if seed_peak_rel is not None: seed_peak_abs_for_plot = seed_peak_rel + offset_samples
 
                     signal_for_plot = data[strong_channel_idx_for_viz] if strong_channel_idx_for_viz is not None else avg_signal_full
                     ch_name_for_plot = raw.ch_names[strong_channel_idx_for_viz] if strong_channel_idx_for_viz is not None else "Average"
@@ -1593,7 +1041,8 @@ if __name__ == '__main__':
                         template_waveform=current_template_for_plot,
                         sfreq=sampleRate,
                         channel_name=ch_name_for_plot,
-                        stim_freq_hz=final_est_stim_freq
+                        stim_freq_hz=final_est_stim_freq,
+                        seed_peak_abs_sample=seed_peak_abs_for_plot
                     )
                 else: # No pulses identified (pulse_starts_rel is None or empty)
                     print("No pulses identified by automatic function, or template generation failed. Skipping full results plot.")
