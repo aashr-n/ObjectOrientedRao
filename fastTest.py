@@ -1192,18 +1192,70 @@ def find_stimulation_pulses_auto(
     mf_kernel = template_waveform[::-1]
     matched_filter_output = np.convolve(avg_signal_epoch, mf_kernel, mode='same')
 
-    mf_peak_threshold = np.percentile(matched_filter_output, 85)
+    mf_peak_percentile = 85 # Define the percentile value
+    mf_peak_threshold = np.percentile(matched_filter_output, mf_peak_percentile)
     mf_distance_samples = int(0.6 * period_samples)
-    
+
     detected_pulse_centers, _ = find_peaks(
         matched_filter_output, height=mf_peak_threshold, distance=mf_distance_samples
     )
 
-    if not detected_pulse_centers.any():
-        print("Automatic Strategy: No pulses found after matched filtering.")
+    if not detected_pulse_centers.size > 0: # Check if array is not empty
+        print("Automatic Strategy: No pulses found after matched filtering (initial pass).")
         return None, None, template_waveform, matched_filter_output
 
-    # Calculate pulse start and end based on the length of the (now dynamic) template_waveform
+    # --- New logic: Refine the first pulse based on seed_peak_location and leeway ---
+    print(f"Automatic Strategy: Initial detection found {len(detected_pulse_centers)} pulses. Refining first pulse...")
+
+    # Tolerance: +/- (3/4) of a stimulation period duration, centered on seed_peak_location
+    # stim_freq_hz, sfreq, and seed_peak_location are available
+    period_s = 1.0 / stim_freq_hz
+    # The expression "3/4stim_freq" means (3/4) / stim_freq_hz or 0.75 * period_s
+    leeway_half_width_s = (3.0 / 4.0) / stim_freq_hz # This is the +/- value in seconds
+    leeway_half_width_samples = int(leeway_half_width_s * sfreq)
+
+    # Define the search window for the "true" first pulse around the seed_peak_location
+    # seed_peak_location is an index in avg_signal_epoch, same as for matched_filter_output
+    expected_first_pulse_min_idx = max(0, seed_peak_location - leeway_half_width_samples)
+    expected_first_pulse_max_idx = min(len(matched_filter_output) - 1, seed_peak_location + leeway_half_width_samples)
+
+    # Find candidate pulses from the initial `detected_pulse_centers` that fall within this leeway window
+    potential_first_pulse_candidates_indices = []
+    for center_idx in detected_pulse_centers:
+        if expected_first_pulse_min_idx <= center_idx <= expected_first_pulse_max_idx:
+            potential_first_pulse_candidates_indices.append(center_idx)
+
+    final_detected_pulse_centers_list = []
+
+    if not potential_first_pulse_candidates_indices:
+        print(f"Automatic Strategy: No matched filter peaks found within the +/- {leeway_half_width_s*1000:.1f} ms "
+              f"leeway (samples: {expected_first_pulse_min_idx}-{expected_first_pulse_max_idx}) "
+              f"around the seed peak (sample {seed_peak_location}). No pulses will be reported.")
+        # If no pulse is within the leeway of the seed, we consider the condition for the first pulse not met.
+        return None, None, template_waveform, matched_filter_output
+    else:
+        # Select the best candidate from the leeway window: the one with the highest matched filter output value
+        confirmed_first_pulse_center = -1
+        max_mf_value_for_first = -np.inf
+        for center_idx in potential_first_pulse_candidates_indices:
+            if matched_filter_output[center_idx] > max_mf_value_for_first:
+                max_mf_value_for_first = matched_filter_output[center_idx]
+                confirmed_first_pulse_center = center_idx
+        
+        print(f"Automatic Strategy: Confirmed first pulse at sample {confirmed_first_pulse_center} "
+              f"(MF score: {max_mf_value_for_first:.2f}) within leeway of seed peak.")
+        final_detected_pulse_centers_list.append(confirmed_first_pulse_center)
+
+        # Add subsequent pulses from the original `detected_pulse_centers` list,
+        # ensuring they are after the `confirmed_first_pulse_center`.
+        # The original `find_peaks` call already ensured they are spaced by `mf_distance_samples`.
+        for center_idx in detected_pulse_centers:
+            if center_idx > confirmed_first_pulse_center:
+                final_detected_pulse_centers_list.append(center_idx)
+        
+        detected_pulse_centers = np.array(final_detected_pulse_centers_list) # Update with refined list
+
+    # --- Calculate pulse start and end based on the (potentially refined) detected_pulse_centers ---
     template_half_len = len(template_waveform) // 2
     pulse_starts_samples = detected_pulse_centers - template_half_len
     # Ensure pulse_ends_samples correctly reflects the full length of template_waveform
@@ -1215,8 +1267,8 @@ def find_stimulation_pulses_auto(
         epoch_times = np.arange(len(avg_signal_epoch)) / sfreq
         ax_mf.plot(epoch_times, matched_filter_output, label='Matched Filter Output')
         if detected_pulse_centers.any():
-            ax_mf.plot(epoch_times[detected_pulse_centers], matched_filter_output[detected_pulse_centers], 'rx', label='Detected Pulse Centers')
-        ax_mf.axhline(mf_peak_threshold, color='k', linestyle='--', label='MF Threshold')
+            ax_mf.plot(epoch_times[detected_pulse_centers], matched_filter_output[detected_pulse_centers], 'rx', markersize=8, label='Final Detected Pulse Centers')
+        ax_mf.axhline(mf_peak_threshold, color='k', linestyle='--', label=f'MF Threshold ({mf_peak_percentile}th percentile)')
         ax_mf.set_title('Step 4: Matched Filter Output and Detected Pulses')
         ax_mf.legend()
         plt.tight_layout() # Apply layout
@@ -1316,12 +1368,15 @@ def plot_comparison_psds(
         estimated_stim_freq (float, optional): Estimated stimulation frequency to mark.
     """
     plt.figure(figsize=(12, 7))
+    
+    if estimated_stim_freq is not None: # Changed line style and color
+        # Draw the vertical line first to put it in the background
+        plt.axvline(estimated_stim_freq, color='green', linestyle='-', alpha=0.6, linewidth=1.5, label=f'Est. Stim Freq: {estimated_stim_freq:.2f} Hz')
+
+    # Plot PSDs on top of the vertical line
     plt.plot(freqs_array, 10 * np.log10(mean_psd_array), label='Mean PSD across all channels', alpha=0.8)
     if strong_channel_psd_array is not None and strong_channel_name:
         plt.plot(freqs_array, 10 * np.log10(strong_channel_psd_array), label=f'PSD of Channel: {strong_channel_name}', alpha=0.8)
-
-    if estimated_stim_freq is not None: # Changed line style and color
-        plt.axvline(estimated_stim_freq, color='green', linestyle='-', alpha=0.6, linewidth=1.5, label=f'Est. Stim Freq: {estimated_stim_freq:.2f} Hz')
 
     plt.xlabel('Frequency (Hz)')
     plt.ylabel('Power Spectral Density (dB/Hz)')
@@ -1346,25 +1401,66 @@ if __name__ == '__main__':
             prominence=0.2,
             distance=50
         )
-
-        # 2. Refine Frequency Estimate using the Strongest Channel
-        final_est_stim_freq = None
+        # 2. Determine Strongest Channel based on Band Power and Refine Frequency
+        final_est_stim_freq = estStimFrequency # Initialize with estimate from mean PSD
         strong_channel_idx_for_viz = None
+
         if estStimFrequency is not None:
             print(f"\nInitial estimated stimulation frequency (from mean PSD): {estStimFrequency:.2f} Hz")
-            channel_relative_prominences = [calculate_single_peak_relative_prominence(psds[i, :], freqs, estStimFrequency, neighborhood_hz_rule=1.0) for i in range(n_channels)]
-            if channel_relative_prominences:
-                strong_channel_idx = np.argmax(channel_relative_prominences)
-                strong_channel_idx_for_viz = strong_channel_idx
-                print(f"Channel with strongest relative prominence: {raw.ch_names[strong_channel_idx]}")
-                final_est_stim_freq = find_prominent_peaks(psd_values=psds[strong_channel_idx, :], frequencies=freqs, prominence=0.1, distance=20)
-                if not final_est_stim_freq:
-                    final_est_stim_freq = estStimFrequency # Fallback
+
+            # New logic for selecting strong_channel_idx_for_viz based on band power
+            target_freq_for_band = estStimFrequency
+            if target_freq_for_band > 0:
+                band_total_width = 1.0 / (target_freq_for_band * 10.0)
+                band_half_width = band_total_width / 2.0
+                
+                lower_b = target_freq_for_band - band_half_width
+                upper_b = target_freq_for_band + band_half_width
+
+                # Ensure bounds are within the actual frequency range available and logical
+                lower_b = max(lower_b, freqs.min())
+                upper_b = min(upper_b, freqs.max())
+
+                if upper_b > lower_b: # Check if the band is valid
+                    freq_mask = (freqs >= lower_b) & (freqs <= upper_b)
+                    
+                    if np.any(freq_mask):
+                        # Calculate sum of PSD values in the band for each channel
+                        channel_band_powers = np.sum(psds[:, freq_mask], axis=1)
+                        
+                        if len(channel_band_powers) > 0 and n_channels > 0:
+                            strong_channel_idx = np.argmax(channel_band_powers)
+                            strong_channel_idx_for_viz = strong_channel_idx
+                            print(f"Channel with strongest power in band [{lower_b:.2f}-{upper_b:.2f} Hz] "
+                                  f"around {target_freq_for_band:.2f} Hz: {raw.ch_names[strong_channel_idx_for_viz]} "
+                                  f"(Power: {channel_band_powers[strong_channel_idx]:.2e})")
+
+                            # Refine final_est_stim_freq using this selected strong channel's PSD
+                            refined_freq_from_strong_channel = find_prominent_peaks(
+                                psd_values=psds[strong_channel_idx_for_viz, :],
+                                frequencies=freqs,
+                                prominence=0.1, # Parameters for refinement
+                                distance=20
+                            )
+                            if refined_freq_from_strong_channel is not None:
+                                final_est_stim_freq = refined_freq_from_strong_channel
+                                # This print will be covered by the one after the if block
+                            # else, final_est_stim_freq remains estStimFrequency (already set)
+                        else:
+                            print("Warning: Could not calculate band powers (e.g., no channels or empty PSDs). Using initial frequency estimate.")
+                    else:
+                        print(f"Warning: Frequency band [{lower_b:.2f}-{upper_b:.2f} Hz] is empty or outside data range. "
+                              "Using initial frequency estimate.")
+                else: # upper_b <= lower_b
+                    print(f"Warning: Invalid frequency band calculated (lower: {lower_b:.2f}, upper: {upper_b:.2f} Hz). Using initial frequency estimate.")
             else:
-                final_est_stim_freq = estStimFrequency
-            print(f"Final estimated stimulation frequency: {final_est_stim_freq:.2f} Hz")
+                print(f"Warning: Initial estimated frequency ({target_freq_for_band:.2f} Hz) is not positive. "
+                      "Cannot define band. Using initial frequency estimate.")
+        
+        if final_est_stim_freq is not None:
+            print(f"Final estimated stimulation frequency to be used: {final_est_stim_freq:.2f} Hz")
         else:
-            print("No initial stimulation frequency found.")
+            print("No stimulation frequency could be determined.")
 
         # Plot the comparison PSDs if data is available
         if 'mean_psd' in locals() and 'freqs' in locals():
@@ -1395,7 +1491,21 @@ if __name__ == '__main__':
 
         # 4. Perform Pulse Identification using the FULLY AUTOMATIC function
         if final_est_stim_freq:
-            signal_for_template, offset_samples = (avg_signal_full[int(epoch_start_s*sampleRate):int(epoch_end_s*sampleRate)], int(epoch_start_s*sampleRate)) if epoch_start_s is not None else (avg_signal_full, 0)
+            # Determine the source signal for template creation
+            if strong_channel_idx_for_viz is not None:
+                source_signal_for_template_creation = data[strong_channel_idx_for_viz]
+                print(f"\nUsing data from strong channel ({raw.ch_names[strong_channel_idx_for_viz]}) for template creation.")
+            else:
+                source_signal_for_template_creation = avg_signal_full
+                print("\nNo strong channel identified or specified; using average signal for template creation.")
+
+            # Epoch the source signal if epoch boundaries are defined
+            if epoch_start_s is not None and epoch_end_s is not None:
+                signal_for_template = source_signal_for_template_creation[int(epoch_start_s*sampleRate):int(epoch_end_s*sampleRate)]
+                offset_samples = int(epoch_start_s*sampleRate)
+            else: # Use the full signal
+                signal_for_template = source_signal_for_template_creation
+                offset_samples = 0
             
             if len(signal_for_template) > 0:
                 # Call the final, automatic function.
