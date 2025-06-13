@@ -490,9 +490,9 @@ def find_stimulation_pulses_auto(
     stim_freq_hz,
     debug_plots=False 
 ):
-    # User wants total template length = 1 / (4 * stim_freq_hz) seconds.
-    # So, template_half_width_s = (1 / (4 * stim_freq_hz)) / 2 = 1 / (8 * stim_freq_hz) seconds.
-    template_half_width_s = 1.0 / (8.0 * stim_freq_hz) 
+    # total template length is 1 / (frac_of_train_interval * stim_freq_hz)
+    frac_of_train_interval = 4
+    template_half_width_s = 1.0 / (2.0 * stim_freq_hz * frac_of_train_interval) 
 
     """
     Automatically detects stimulation pulses with varying numbers of components
@@ -660,117 +660,110 @@ def find_stimulation_pulses_auto(
 
     # MF threshold is removed as per request. We will find all peaks based on distance.
     mf_distance_samples = int(0.6 * period_samples)
-
-    detected_pulse_centers, _ = find_peaks(
+    # This initial find_peaks call gives us all potential candidates, sorted by index.
+    # The 'distance' parameter here helps to avoid picking multiple points from a single broad MF peak.
+    all_mf_candidates, _ = find_peaks(
         matched_filter_output, height=None, distance=mf_distance_samples # height=None removes thresholding
     )
 
-    if not detected_pulse_centers.size > 0: # Check if array is not empty
+    if not all_mf_candidates.size > 0: # Check if array is not empty
         print("Automatic Strategy: No pulses found after matched filtering (initial pass).")
         return None, None, template_waveform, matched_filter_output, seed_peak_location
 
     # --- New logic: Refine the first pulse based on seed_peak_location and leeway ---
-    print(f"Automatic Strategy: Initial detection found {len(detected_pulse_centers)} pulses. Refining first pulse...")
+    print(f"Automatic Strategy: Initial detection found {len(all_mf_candidates)} pulses. Refining first pulse...")
 
     # Tolerance: +/- (3/4) of a stimulation period duration, centered on seed_peak_location
-    # stim_freq_hz, sfreq, and seed_peak_location are available
-    period_s = 1.0 / stim_freq_hz
-    # The expression "3/4stim_freq" means (3/4) / stim_freq_hz or 0.75 * period_s
-    leeway_half_width_s = (3.0 / 4.0) / stim_freq_hz # This is the +/- value in seconds
-    leeway_half_width_samples = int(leeway_half_width_s * sfreq)
-
-    # Define the search window for the "true" first pulse around the seed_peak_location
-    # seed_peak_location is an index in avg_signal_epoch, same as for matched_filter_output
-    expected_first_pulse_min_idx = max(0, seed_peak_location - leeway_half_width_samples)
-    expected_first_pulse_max_idx = min(len(matched_filter_output) - 1, seed_peak_location + leeway_half_width_samples)
-
-    # Find candidate pulses from the initial `detected_pulse_centers` that fall within this leeway window
-    potential_first_pulse_candidates_indices = []
-    for center_idx in detected_pulse_centers:
-        if expected_first_pulse_min_idx <= center_idx <= expected_first_pulse_max_idx:
-            potential_first_pulse_candidates_indices.append(center_idx)
-
     final_detected_pulse_centers_list = []
 
-    if not potential_first_pulse_candidates_indices:
-        print(f"Automatic Strategy: No matched filter peaks found within the +/- {leeway_half_width_s*1000:.1f} ms "
-              f"leeway (samples: {expected_first_pulse_min_idx}-{expected_first_pulse_max_idx}) "
-              f"around the seed peak (sample {seed_peak_location}). No pulses will be reported.")
-        # If no pulse is within the leeway of the seed, we consider the condition for the first pulse not met.
+    # --- First Pulse: Directly use the seed_peak_location ---
+    if not (0 <= seed_peak_location < len(matched_filter_output)):
+        print(f"Automatic Strategy: seed_peak_location ({seed_peak_location}) is out of bounds "
+              f"for matched_filter_output (len: {len(matched_filter_output)}). Cannot set first pulse.")
         return None, None, template_waveform, matched_filter_output, seed_peak_location
-    else:
-        # Select the best candidate from the leeway window: the one with the highest matched filter output value
-        confirmed_first_pulse_center = -1
-        max_mf_value_for_first = -np.inf
-        for center_idx in potential_first_pulse_candidates_indices:
-            if matched_filter_output[center_idx] > max_mf_value_for_first:
-                max_mf_value_for_first = matched_filter_output[center_idx]
-                confirmed_first_pulse_center = center_idx
+
+    first_pulse_center = seed_peak_location
+    final_detected_pulse_centers_list.append(first_pulse_center)
+    print(f"Automatic Strategy: Set first pulse center to seed_peak_location: {first_pulse_center} "
+          f"(MF score at seed: {matched_filter_output[first_pulse_center]:.2f})")
+    last_confirmed_pulse_center = first_pulse_center
+
+    # --- Iteratively find subsequent pulses ---
+    # period_samples is already int(sfreq / stim_freq_hz)
+    tolerance_samples = int(round(period_samples /4.0)) # +/- 1/4th of a period
+
+    while True:
+        # --- Define search window for the next pulse ---
+        expected_next_center_ideal = last_confirmed_pulse_center + period_samples
         
-        print(f"Automatic Strategy: Confirmed first pulse at sample {confirmed_first_pulse_center} "
-              f"(MF score: {max_mf_value_for_first:.2f}) within leeway of initial seed peak.")
-        final_detected_pulse_centers_list.append(confirmed_first_pulse_center)
+        # Define search window
+        search_window_min = expected_next_center_ideal - tolerance_samples
+        search_window_max = expected_next_center_ideal + tolerance_samples
 
-        # Iteratively find subsequent pulses based on the new criteria
-        # For aligning the pulse window, we use the geometric center of the template.
-        alignment_offset_in_template_for_loop = len(template_waveform) // 2 # Same as alignment_offset_in_template later
-        len_template_waveform_for_loop = len(template_waveform)
-
-        # Start with the end of the first confirmed pulse
-        last_detected_pulse_center = confirmed_first_pulse_center # Keep track of the center of the last pulse
-        current_pulse_start_sample = (last_detected_pulse_center - alignment_offset_in_template_for_loop)
-        current_pulse_end_sample = current_pulse_start_sample + len_template_waveform_for_loop
+        # Ensure search window is within signal bounds for matched_filter_output
+        # (also applies to avg_signal_epoch as they have the same length)
+        if search_window_min >= len(avg_signal_epoch):
+            print(f"Automatic Strategy: Search window for next pulse (min: {search_window_min}) is beyond signal length. Stopping search.")
+            break
         
-        # `detected_pulse_centers` contains all peaks from the initial MF scan,
-        # already filtered by height (mf_peak_threshold) and distance (mf_distance_samples).
-        # We sort them to process candidates in order.
-        all_initial_candidates = sorted(detected_pulse_centers)
+        # Clip window to be within bounds of matched_filter_output
+        search_window_min_abs = max(0, search_window_min)
+        search_window_max_abs = min(len(avg_signal_epoch) - 1, search_window_max)
 
-        # period_samples is already defined as int(sfreq / stim_freq_hz)
-
-        while True:
-            potential_next_pulses_in_window = []
-            # Find candidates whose *center* is within one period *after the end* of the last found pulse
-            for candidate_idx in all_initial_candidates:
-                # Candidate must start after the end of the current pulse
-                if candidate_idx <= current_pulse_end_sample: # Check if center is after the end
-                                                              # or if it's a previously considered/added pulse center
-                    continue 
-                
-                # Condition 1: Candidate center is < 1 period from the END of the previous pulse.
-                cond1_max_dist = (candidate_idx - current_pulse_end_sample) < period_samples
-                # Condition 2: Candidate center is >= 1 period from the START of the previous pulse.
-                cond2_min_dist = (candidate_idx - current_pulse_start_sample) >= period_samples
-
-                if cond1_max_dist and cond2_min_dist:
-                    potential_next_pulses_in_window.append(candidate_idx)
-                elif not cond1_max_dist: # (candidate_idx - current_pulse_end_sample) >= period_samples
-                    # Since all_initial_candidates is sorted, no further candidates will be in this window
-                    # (violating cond1_max_dist), no subsequent candidates will satisfy it either.
-                    break 
-            
-            if not potential_next_pulses_in_window:
-                break # No more pulses found in the next 1-period window from the last detected one
-            # Select the pulse with the highest matched filter score from this window
-            next_pulse_center = potential_next_pulses_in_window[
-                np.argmax(matched_filter_output[potential_next_pulses_in_window])
-            ]
-            
-            final_detected_pulse_centers_list.append(next_pulse_center)
-            
-            # Update references for the next iteration based on the newly added pulse
-            last_detected_pulse_center = next_pulse_center
-            current_pulse_start_sample = (last_detected_pulse_center - alignment_offset_in_template_for_loop)
-            current_pulse_end_sample = current_pulse_start_sample + len_template_waveform_for_loop
+        # --- Find the most prominent peak in avg_signal_epoch within this search window ---
+        current_search_sub_epoch = avg_signal_epoch[search_window_min_abs : search_window_max_abs + 1]
         
-        detected_pulse_centers = np.array(final_detected_pulse_centers_list) # Update with refined list
+        if len(current_search_sub_epoch) < 3: # find_peaks needs at least 3 samples for non-edge peaks
+            print(f"Automatic Strategy: Search window segment (length {len(current_search_sub_epoch)}) is too short. Stopping search.")
+            break 
+
+        # Find positive-going peaks and select the one with max prominence in this window
+        local_peak_indices_in_sub_epoch, local_properties = find_peaks(current_search_sub_epoch, prominence=1e-9) # Small prominence to get candidates
+
+        if not local_peak_indices_in_sub_epoch.any():
+            print(f"Automatic Strategy: No initial peaks found in avg_signal_epoch within window "
+                  f"[{search_window_min_abs}, {search_window_max_abs}] around expected center {expected_next_center_ideal:.0f}. Stopping search.")
+            break
+        
+        # Filter out peaks at the very edges of the current_search_sub_epoch for robust prominence.
+        non_edge_mask_local = (local_peak_indices_in_sub_epoch > 0) & \
+                              (local_peak_indices_in_sub_epoch < len(current_search_sub_epoch) - 1)
+        
+        local_peak_indices_filtered = local_peak_indices_in_sub_epoch[non_edge_mask_local]
+        
+        if not local_peak_indices_filtered.any():
+            print(f"Automatic Strategy: All peaks in window [{search_window_min_abs}, {search_window_max_abs}] "
+                  f"were at the edges of the sub-segment. Cannot determine most prominent. Stopping search.")
+            break
+
+        local_prominences_filtered = local_properties["prominences"][non_edge_mask_local]
+        if not local_prominences_filtered.any(): # Should be caught by above check
+             print(f"Automatic Strategy: No prominences for non-edge peaks in window. Stopping search.")
+             break
+
+        idx_of_max_prom_in_local_peaks = np.argmax(local_prominences_filtered)
+        best_local_peak_offset = local_peak_indices_filtered[idx_of_max_prom_in_local_peaks]
+        
+        # Convert local index back to absolute index in avg_signal_epoch
+        next_pulse_center = search_window_min_abs + best_local_peak_offset
+        
+        # Safety check: ensure we are moving forward
+        if next_pulse_center <= last_confirmed_pulse_center:
+            print(f"Automatic Strategy: Newly found peak ({next_pulse_center}) is not after last confirmed peak ({last_confirmed_pulse_center}). Stopping.")
+            break
+        
+        final_detected_pulse_centers_list.append(next_pulse_center)
+        print(f"Automatic Strategy: Found next pulse at {next_pulse_center} (expected near {expected_next_center_ideal:.0f}, "
+              f"tolerance: +/- {tolerance_samples} samples, raw signal prominence: {local_prominences_filtered[idx_of_max_prom_in_local_peaks]:.2f})")
+        last_confirmed_pulse_center = next_pulse_center
+        
+    detected_pulse_centers = np.array(final_detected_pulse_centers_list)
 
     # --- Calculate pulse start and end based on the (potentially refined) detected_pulse_centers ---
     # For aligning the pulse window, we use the geometric center of the template,
     # ensuring that detected_pulse_centers corresponds to the center of the highlighted artifact.
-    # The seed_peak_location was placed at the geometric center of the template during extraction.
     alignment_offset_in_template = len(template_waveform) // 2
-    
+            
     pulse_starts_samples = detected_pulse_centers - alignment_offset_in_template
     # Ensure pulse_ends_samples correctly reflects the full length of template_waveform.
     pulse_ends_samples = pulse_starts_samples + len(template_waveform)
