@@ -938,6 +938,109 @@ def plot_comparison_psds(
     plt.tight_layout()
     # plt.show() # Will be called once in main
 
+# --- New Plotting function for signal and its derivatives ---
+def plot_signal_and_derivatives(
+    signal_data,
+    times_array,
+    signal_name="Signal",
+    stim_freq_hz=None,
+    pulse_starts_samples=None,
+    pulse_ends_samples=None,
+    sfreq=None
+):
+    """
+    Plots the signal, its first derivative, and its second derivative.
+    All subplots will have linked x-axes.
+
+    Args:
+        signal_data (np.ndarray): The 1D time series data.
+        times_array (np.ndarray): The corresponding time vector for the signal.
+        signal_name (str): Name of the signal for titles.
+        stim_freq_hz (float, optional): Estimated stimulation frequency for title.
+        pulse_starts_samples (np.ndarray, optional): Array of start samples for each detected pulse.
+        pulse_ends_samples (np.ndarray, optional): Array of end samples for each detected pulse.
+        sfreq (float, optional): Sampling frequency, required if pulse samples are provided.
+    """
+    if len(signal_data) != len(times_array):
+        print("Error in plot_signal_and_derivatives: signal_data and times_array must have the same length.")
+        return
+
+    # Calculate derivatives
+    first_derivative = np.diff(signal_data)
+    second_derivative = np.diff(first_derivative)
+
+    fig, axes = plt.subplots(3, 1, figsize=(18, 12), sharex=True)
+    
+    title_prefix = f'{signal_name} Analysis'
+    if stim_freq_hz:
+        title_prefix = f'{signal_name} Analysis (Est. Stim Freq: {stim_freq_hz:.2f} Hz)'
+    fig.suptitle(title_prefix, fontsize=16)
+
+    # Plot Original Signal
+    axes[0].plot(times_array, signal_data, label='Original Signal', color='royalblue')
+    axes[0].set_title('Original Time Series')
+    axes[0].set_ylabel('Amplitude')
+    axes[0].grid(True, alpha=0.5)
+    axes[0].legend(loc='upper right')
+    if pulse_starts_samples is not None and pulse_ends_samples is not None and \
+       len(pulse_starts_samples) > 0 and sfreq is not None:
+        first_span = True
+        first_max_deriv_marker = True # For legend of max derivative points
+        for start_samp, end_samp in zip(pulse_starts_samples, pulse_ends_samples):
+            start_time = start_samp / sfreq
+            end_time = end_samp / sfreq
+            label = 'Detected Pulses' if first_span else '_nolegend_'
+            axes[0].axvspan(start_time, end_time, color='lightcoral', alpha=0.3, label=label)
+            if first_span:
+                first_span = False
+
+            # Mark point of highest first derivative within this pulse on the original signal
+            if end_samp > start_samp + 1: # Need at least 2 points for diff
+                pulse_segment_signal = signal_data[start_samp:end_samp]
+                if len(pulse_segment_signal) > 1: # Ensure segment is not too short
+                    pulse_first_derivative = np.diff(pulse_segment_signal)
+                    if len(pulse_first_derivative) > 0:
+                        idx_max_deriv_local = np.argmax(pulse_first_derivative)
+                        # The point on original signal corresponds to the end of the interval with max slope
+                        # or idx_max_deriv_local if we consider the start. Let's use idx_max_deriv_local + 1.
+                        abs_idx_max_deriv_pt = start_samp + idx_max_deriv_local + 1
+                        
+                        if abs_idx_max_deriv_pt < len(times_array): # Boundary check
+                            marker_label = 'Max 1st Deriv in Pulse' if first_max_deriv_marker else '_nolegend_'
+                            axes[0].plot(times_array[abs_idx_max_deriv_pt], signal_data[abs_idx_max_deriv_pt], 'X', color='magenta', markersize=8, label=marker_label)
+                            if first_max_deriv_marker: first_max_deriv_marker = False
+        axes[0].legend(loc='upper right') # Re-call legend
+
+    # Plot First Derivative
+    # np.diff reduces length by 1, so times_array[1:] aligns with the derivative
+    axes[1].plot(times_array[1:], first_derivative, label='First Derivative', color='forestgreen')
+    axes[1].set_title('First Derivative')
+    axes[1].set_ylabel('d(Amplitude)/dt')
+    axes[1].grid(True, alpha=0.5)
+    axes[1].legend(loc='upper right')
+    if pulse_starts_samples is not None and pulse_ends_samples is not None and \
+       len(pulse_starts_samples) > 0 and sfreq is not None:
+        for start_samp, end_samp in zip(pulse_starts_samples, pulse_ends_samples):
+            start_time = start_samp / sfreq
+            end_time = end_samp / sfreq
+            axes[1].axvspan(start_time, end_time, color='lightcoral', alpha=0.3)
+
+    # Plot Second Derivative
+    # np.diff applied twice reduces length by 2
+    axes[2].plot(times_array[2:], second_derivative, label='Second Derivative', color='darkorange')
+    axes[2].set_title('Second Derivative')
+    axes[2].set_ylabel('d^2(Amplitude)/dt^2')
+    axes[2].set_xlabel('Time (s)')
+    axes[2].grid(True, alpha=0.5)
+    axes[2].legend(loc='upper right')
+    if pulse_starts_samples is not None and pulse_ends_samples is not None and \
+       len(pulse_starts_samples) > 0 and sfreq is not None:
+        for start_samp, end_samp in zip(pulse_starts_samples, pulse_ends_samples):
+            start_time = start_samp / sfreq
+            end_time = end_samp / sfreq
+            axes[2].axvspan(start_time, end_time, color='lightcoral', alpha=0.3)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust for suptitle
+    # plt.show() will be called once in main
 
 # --- Main Execution Block (Corrected) ---
 if __name__ == '__main__':
@@ -1027,6 +1130,7 @@ if __name__ == '__main__':
                 strong_channel_name=ch_name_strong_for_plot,
                 estimated_stim_freq=final_est_stim_freq)
 
+        # Note: plot_signal_and_derivatives will be called later, after pulse detection
         # 3. Determine and Visualize the Stimulation Epoch
         epoch_start_s, epoch_end_s = None, None
         if final_est_stim_freq is not None:
@@ -1104,6 +1208,20 @@ if __name__ == '__main__':
                         stim_freq_hz=final_est_stim_freq,
                         seed_peak_abs_sample=seed_peak_abs_for_plot
                     )
+
+                    # Now plot the signal and its derivatives with the detected pulses
+                    if 'avg_signal_full' in locals() and 'raw' in locals() and hasattr(raw, 'times'):
+                        plot_signal_and_derivatives(
+                            signal_data=avg_signal_full, # Or signal_for_plot if you prefer the channel data
+                            times_array=raw.times,
+                            signal_name="Average Signal", # Or ch_name_for_plot
+                            stim_freq_hz=final_est_stim_freq,
+                            pulse_starts_samples=pulse_starts_abs.astype(int) if pulse_starts_abs is not None else np.array([]),
+                            pulse_ends_samples=pulse_ends_abs.astype(int) if pulse_ends_abs is not None else np.array([]),
+                            sfreq=sampleRate
+                        )
+                    else:
+                        print("Could not plot signal and derivatives due to missing data (avg_signal_full or raw.times).")
                 else: # No pulses identified (pulse_starts_rel is None or empty)
                     print("No pulses identified by automatic function, or template generation failed. Skipping full results plot.")
                     # You could optionally plot just the raw signal here if desired, e.g.:
