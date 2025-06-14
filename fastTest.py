@@ -946,7 +946,7 @@ def plot_signal_and_derivatives(
     stim_freq_hz=None,
     pulse_starts_samples=None,
     pulse_ends_samples=None,
-    sfreq=None
+    sfreq=None,
 ):
     """
     Plots the signal, its first derivative, and its second derivative.
@@ -967,7 +967,10 @@ def plot_signal_and_derivatives(
 
     # Calculate derivatives
     first_derivative = np.diff(signal_data)
-    second_derivative = np.diff(first_derivative)
+    if len(first_derivative) > 0:
+        second_derivative = np.diff(first_derivative)
+    else:
+        second_derivative = np.array([])
 
     fig, axes = plt.subplots(3, 1, figsize=(18, 12), sharex=True)
     
@@ -984,32 +987,72 @@ def plot_signal_and_derivatives(
     axes[0].legend(loc='upper right')
     if pulse_starts_samples is not None and pulse_ends_samples is not None and \
        len(pulse_starts_samples) > 0 and sfreq is not None:
-        first_span = True
-        first_max_deriv_marker = True # For legend of max derivative points
+        first_pulse_span_legend = True
+        any_conditional_marker_plotted = False # To track if any D1@inflection markers are plotted
+        first_conditional_max_deriv_marker = True # For legend of the new marker
+
         for start_samp, end_samp in zip(pulse_starts_samples, pulse_ends_samples):
             start_time = start_samp / sfreq
             end_time = end_samp / sfreq
-            label = 'Detected Pulses' if first_span else '_nolegend_'
+            label = 'Detected Pulses' if first_pulse_span_legend else '_nolegend_'
             axes[0].axvspan(start_time, end_time, color='lightcoral', alpha=0.3, label=label)
-            if first_span:
-                first_span = False
+            if first_pulse_span_legend:
+                first_pulse_span_legend = False
 
-            # Mark point of highest first derivative within this pulse on the original signal
-            if end_samp > start_samp + 1: # Need at least 2 points for diff
-                pulse_segment_signal = signal_data[start_samp:end_samp]
-                if len(pulse_segment_signal) > 1: # Ensure segment is not too short
-                    pulse_first_derivative = np.diff(pulse_segment_signal)
-                    if len(pulse_first_derivative) > 0:
-                        idx_max_deriv_local = np.argmax(pulse_first_derivative)
-                        # The point on original signal corresponds to the end of the interval with max slope
-                        # or idx_max_deriv_local if we consider the start. Let's use idx_max_deriv_local + 1.
-                        abs_idx_max_deriv_pt = start_samp + idx_max_deriv_local + 1
-                        
-                        if abs_idx_max_deriv_pt < len(times_array): # Boundary check
-                            marker_label = 'Max 1st Deriv in Pulse' if first_max_deriv_marker else '_nolegend_'
-                            axes[0].plot(times_array[abs_idx_max_deriv_pt], signal_data[abs_idx_max_deriv_pt], 'X', color='magenta', markersize=8, label=marker_label)
-                            if first_max_deriv_marker: first_max_deriv_marker = False
+            # Revised logic: Mark point of highest 1st derivative at D2 inflection points
+            best_d1_at_inflection = -np.inf
+            mark_abs_signal_idx_at_inflection = None
+
+            if end_samp - start_samp >= 3 and len(second_derivative) > 0: # Pulse long enough for D2 analysis
+                # Define the slice of second_derivative relevant to this pulse
+                # second_derivative[i] is related to signal_data[i+2]
+                # For signal_data[start_samp ... end_samp-1],
+                # D2 indices are from start_samp-2 to (end_samp-1)-2 = end_samp-3
+                d2_seg_start_idx = max(0, start_samp - 2)
+                d2_seg_end_idx = min(len(second_derivative), end_samp - 2) # exclusive for slicing
+
+                if d2_seg_start_idx < d2_seg_end_idx:
+                    pulse_d2_values = second_derivative[d2_seg_start_idx:d2_seg_end_idx]
+
+                    if len(pulse_d2_values) > 1: # Need at least 2 D2 values for np.diff
+                        # local_zc_indices are indices within pulse_d2_values
+                        # where a sign change occurs *after* this index
+                        local_zc_indices = np.where(np.diff(np.sign(pulse_d2_values)))[0]
+
+                        for local_zc_idx in local_zc_indices:
+                            # Inflection is between point related to pulse_d2_values[local_zc_idx]
+                            # and pulse_d2_values[local_zc_idx+1].
+                            # Consider signal points corresponding to the D2 samples involved in the sign change.
+                            # Signal point related to pulse_d2_values[local_zc_idx]
+                            candidate_sig_idx1 = d2_seg_start_idx + local_zc_idx + 2
+                            # Signal point related to pulse_d2_values[local_zc_idx+1]
+                            candidate_sig_idx2 = d2_seg_start_idx + local_zc_idx + 1 + 2
+
+                            for candidate_abs_signal_idx in [candidate_sig_idx1, candidate_sig_idx2]:
+                                # Check bounds for signal_data and first_derivative
+                                if candidate_abs_signal_idx > 0 and \
+                                   candidate_abs_signal_idx < len(signal_data) and \
+                                   (candidate_abs_signal_idx - 1) >= 0 and \
+                                   (candidate_abs_signal_idx - 1) < len(first_derivative):
+                                    
+                                    current_d1_val = first_derivative[candidate_abs_signal_idx - 1]
+                                    if current_d1_val > best_d1_at_inflection:
+                                        best_d1_at_inflection = current_d1_val
+                                        mark_abs_signal_idx_at_inflection = candidate_abs_signal_idx
+                    
+            if mark_abs_signal_idx_at_inflection is not None:
+                marker_label = 'Max D1 at Inflection' if first_conditional_max_deriv_marker else '_nolegend_'
+                axes[0].plot(times_array[mark_abs_signal_idx_at_inflection], signal_data[mark_abs_signal_idx_at_inflection], 
+                             'P', color='cyan', markersize=9, markeredgecolor='black', label=marker_label)
+                any_conditional_marker_plotted = True
+                if first_conditional_max_deriv_marker: 
+                    first_conditional_max_deriv_marker = False
         axes[0].legend(loc='upper right') # Re-call legend
+
+        if not any_conditional_marker_plotted and len(pulse_starts_samples) > 0 :
+            print(f"INFO: No 'Max D1 at Inflection' markers were plotted for any pulse. "
+                  f"This could be due to no clear inflection points (sign changes in D2) found within pulses, "
+                  f"or D1 values at these points were not positive maxima.")
 
     # Plot First Derivative
     # np.diff reduces length by 1, so times_array[1:] aligns with the derivative
@@ -1024,6 +1067,11 @@ def plot_signal_and_derivatives(
             start_time = start_samp / sfreq
             end_time = end_samp / sfreq
             axes[1].axvspan(start_time, end_time, color='lightcoral', alpha=0.3)
+    if len(first_derivative) > 0:
+        max_abs_d1 = np.max(np.abs(first_derivative))
+        if max_abs_d1 > 0: # Avoid setting ylim to [0,0] if derivative is flat zero
+            axes[1].set_ylim(-max_abs_d1 * 1.1, max_abs_d1 * 1.1) # Add 10% padding
+
 
     # Plot Second Derivative
     # np.diff applied twice reduces length by 2
@@ -1039,6 +1087,16 @@ def plot_signal_and_derivatives(
             start_time = start_samp / sfreq
             end_time = end_samp / sfreq
             axes[2].axvspan(start_time, end_time, color='lightcoral', alpha=0.3)
+    if len(second_derivative) > 0:
+        max_abs_d2 = np.max(np.abs(second_derivative))
+        if max_abs_d2 > 0: # Avoid setting ylim to [0,0]
+            axes[2].set_ylim(-max_abs_d2 * 1.1, max_abs_d2 * 1.1) # Add 10% padding
+
+    # Disable y-axis autoscaling for derivative plots after initial setup.
+    # This prevents y-panning while allowing y-zooming via specific zoom tools.
+    axes[1].autoscale(enable=False, axis='y')
+    axes[2].autoscale(enable=False, axis='y')
+
     plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust for suptitle
     # plt.show() will be called once in main
 
