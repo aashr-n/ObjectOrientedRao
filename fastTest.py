@@ -783,7 +783,7 @@ def find_stimulation_pulses_auto(
         # plt.show() # Removed: will be called once in main
 
     print(f"Identified {len(pulse_starts_samples)} stimulation pulses automatically.")
-    return pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output, seed_peak_location
+    return pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output, seed_peak_location, detected_pulse_centers
 
 
 # --- Plotting function for pulse identification results ---
@@ -947,6 +947,7 @@ def plot_signal_and_derivatives(
     pulse_starts_samples=None,
     pulse_ends_samples=None,
     sfreq=None,
+    estimated_stim_centers_samples=None # New argument for stim centers
 ):
     """
     Plots the signal, its first derivative, and its second derivative.
@@ -960,6 +961,8 @@ def plot_signal_and_derivatives(
         pulse_starts_samples (np.ndarray, optional): Array of start samples for each detected pulse.
         pulse_ends_samples (np.ndarray, optional): Array of end samples for each detected pulse.
         sfreq (float, optional): Sampling frequency, required if pulse samples are provided.
+        estimated_stim_centers_samples (np.ndarray, optional): Absolute sample indices of
+            estimated stimulation centers.
     """
     if len(signal_data) != len(times_array):
         print("Error in plot_signal_and_derivatives: signal_data and times_array must have the same length.")
@@ -969,10 +972,27 @@ def plot_signal_and_derivatives(
     first_derivative = np.diff(signal_data)
     if len(first_derivative) > 0:
         second_derivative = np.diff(first_derivative)
+        if len(second_derivative) > 0:
+            third_derivative = np.diff(second_derivative)
+            if len(third_derivative) > 0:
+                fourth_derivative = np.diff(third_derivative)
+                if len(fourth_derivative) > 0:
+                    fifth_derivative = np.diff(fourth_derivative)
+                    if len(fifth_derivative) > 0:
+                        sixth_derivative = np.diff(fifth_derivative)
+                        if len(sixth_derivative) > 0:
+                            seventh_derivative = np.diff(sixth_derivative)
+                            if len(seventh_derivative) > 0:
+                                eighth_derivative = np.diff(seventh_derivative)
+                            else: eighth_derivative = np.array([])
+                        else: seventh_derivative, eighth_derivative = np.array([]), np.array([])
+                    else: sixth_derivative, seventh_derivative, eighth_derivative = np.array([]), np.array([]), np.array([])
+                else: fifth_derivative, sixth_derivative, seventh_derivative, eighth_derivative = np.array([]), np.array([]), np.array([]), np.array([])
+            else: fourth_derivative, fifth_derivative, sixth_derivative, seventh_derivative, eighth_derivative = np.array([]), np.array([]), np.array([]), np.array([]), np.array([])
+        else: third_derivative, fourth_derivative, fifth_derivative, sixth_derivative, seventh_derivative, eighth_derivative = np.array([]), np.array([]), np.array([]), np.array([]), np.array([]), np.array([])
     else:
-        second_derivative = np.array([])
-
-    fig, axes = plt.subplots(3, 1, figsize=(18, 12), sharex=True)
+        second_derivative, third_derivative, fourth_derivative, fifth_derivative, sixth_derivative, seventh_derivative, eighth_derivative = np.array([]), np.array([]), np.array([]), np.array([]), np.array([]), np.array([]), np.array([])
+    fig, axes = plt.subplots(9, 1, figsize=(18, 36), sharex=True) # Now 9 subplots
     
     title_prefix = f'{signal_name} Analysis'
     if stim_freq_hz:
@@ -1092,16 +1112,193 @@ def plot_signal_and_derivatives(
         if max_abs_d2 > 0: # Avoid setting ylim to [0,0]
             axes[2].set_ylim(-max_abs_d2 * 1.1, max_abs_d2 * 1.1) # Add 10% padding
 
+    # Plot Third Derivative
+    axes[3].plot(times_array[3:], third_derivative, label='Third Derivative', color='purple')
+    axes[3].set_title('Third Derivative')
+    axes[3].set_ylabel('d^3(Amplitude)/dt^3')
+    axes[3].grid(True, alpha=0.5)
+    axes[3].legend(loc='upper right')
+    if pulse_starts_samples is not None and pulse_ends_samples is not None and \
+       len(pulse_starts_samples) > 0 and sfreq is not None:
+        for start_samp, end_samp in zip(pulse_starts_samples, pulse_ends_samples):
+            start_time = start_samp / sfreq
+            end_time = end_samp / sfreq
+            axes[3].axvspan(start_time, end_time, color='lightcoral', alpha=0.3)
+    if len(third_derivative) > 0:
+        max_abs_d3 = np.max(np.abs(third_derivative))
+        if max_abs_d3 > 0:
+            axes[3].set_ylim(-max_abs_d3 * 1.1, max_abs_d3 * 1.1)
+
+    # Plot Fourth Derivative
+    axes[4].plot(times_array[4:], fourth_derivative, label='Fourth Derivative', color='brown')
+    axes[4].set_title('Fourth Derivative')
+    axes[4].set_ylabel('d^4(Amplitude)/dt^4')
+    axes[4].set_xlabel('Time (s)') # X-label only on the last plot
+    axes[4].grid(True, alpha=0.5)
+    axes[4].legend(loc='upper right')
+    if pulse_starts_samples is not None and pulse_ends_samples is not None and \
+       len(pulse_starts_samples) > 0 and sfreq is not None:
+        for start_samp, end_samp in zip(pulse_starts_samples, pulse_ends_samples):
+            start_time = start_samp / sfreq
+            end_time = end_samp / sfreq
+            axes[4].axvspan(start_time, end_time, color='lightcoral', alpha=0.3)
+    if len(fourth_derivative) > 0:
+        max_abs_d4 = np.max(np.abs(fourth_derivative))
+        if max_abs_d4 > 0:
+            axes[4].set_ylim(-max_abs_d4 * 1.1, max_abs_d4 * 1.1)
+
+    # Mark highest/lowest 4th derivative points around estimated stim centers
+    if len(fourth_derivative) > 0 and \
+       estimated_stim_centers_samples is not None and \
+       len(estimated_stim_centers_samples) > 0 and \
+       stim_freq_hz is not None and stim_freq_hz > 0 and \
+       sfreq is not None:
+
+        period_samples = sfreq / stim_freq_hz
+        half_period_search_samples = int(period_samples / 2.0)
+        first_max_marker_before = True
+        first_min_marker_after = True
+
+        for center_samp_abs_sig in estimated_stim_centers_samples:
+            # Window 1: Before center (for max D4)
+            # Signal indices for search: [center_samp_abs_sig - half_period_search_samples, center_samp_abs_sig]
+            s1_start_sig = max(0, center_samp_abs_sig - half_period_search_samples)
+            s1_end_sig = center_samp_abs_sig # Inclusive end for this logic step in signal time
+
+            # Corresponding D4 indices (D4[i] corresponds to signal[i+4])
+            d4_s1_start_idx = max(0, s1_start_sig - 4)
+            d4_s1_end_idx = max(0, s1_end_sig - 4) 
+
+            if d4_s1_start_idx <= d4_s1_end_idx and d4_s1_end_idx < len(fourth_derivative):
+                segment1_d4 = fourth_derivative[d4_s1_start_idx : d4_s1_end_idx + 1]
+                if len(segment1_d4) > 0:
+                    idx_max_local_d4 = np.argmax(segment1_d4)
+                    abs_idx_d4_max_in_d4_array = d4_s1_start_idx + idx_max_local_d4
+                    time_idx_for_plot_max = abs_idx_d4_max_in_d4_array + 4 # Convert D4 index back to signal time index
+                    if 0 <= time_idx_for_plot_max < len(times_array):
+                        label = "Max D4 (Before Center)" if first_max_marker_before else "_nolegend_"
+                        axes[4].plot(times_array[time_idx_for_plot_max], 
+                                     fourth_derivative[abs_idx_d4_max_in_d4_array], 
+                                     'P', color='red', markersize=8, markeredgecolor='black', label=label)
+                        if first_max_marker_before: first_max_marker_before = False
+            
+            # Window 2: After center (for min D4)
+            # Signal indices for search: [center_samp_abs_sig, center_samp_abs_sig + half_period_search_samples]
+            s2_start_sig = center_samp_abs_sig
+            s2_end_sig = min(len(signal_data)-1, center_samp_abs_sig + half_period_search_samples) 
+
+            d4_s2_start_idx = max(0, s2_start_sig - 4)
+            d4_s2_end_idx = max(0, s2_end_sig - 4)
+
+            if d4_s2_start_idx <= d4_s2_end_idx and d4_s2_end_idx < len(fourth_derivative):
+                segment2_d4 = fourth_derivative[d4_s2_start_idx : d4_s2_end_idx + 1]
+                if len(segment2_d4) > 0:
+                    idx_min_local_d4 = np.argmin(segment2_d4)
+                    abs_idx_d4_min_in_d4_array = d4_s2_start_idx + idx_min_local_d4
+                    time_idx_for_plot_min = abs_idx_d4_min_in_d4_array + 4 # Convert D4 index back to signal time index
+                    if 0 <= time_idx_for_plot_min < len(times_array):
+                        label = "Min D4 (After Center)" if first_min_marker_after else "_nolegend_"
+                        axes[4].plot(times_array[time_idx_for_plot_min],
+                                     fourth_derivative[abs_idx_d4_min_in_d4_array],
+                                     'X', color='blue', markersize=8, markeredgecolor='black', label=label)
+                        if first_min_marker_after: first_min_marker_after = False
+        if not first_max_marker_before or not first_min_marker_after: # if any marker was plotted
+            axes[4].legend(loc='upper right') # Update legend
+
+    # Plot Fifth Derivative
+    axes[5].plot(times_array[5:], fifth_derivative, label='Fifth Derivative', color='teal')
+    axes[5].set_title('Fifth Derivative')
+    axes[5].set_ylabel('d^5(Amplitude)/dt^5')
+    axes[5].grid(True, alpha=0.5)
+    axes[5].legend(loc='upper right')
+    if pulse_starts_samples is not None and pulse_ends_samples is not None and \
+       len(pulse_starts_samples) > 0 and sfreq is not None:
+        for start_samp, end_samp in zip(pulse_starts_samples, pulse_ends_samples):
+            start_time = start_samp / sfreq
+            end_time = end_samp / sfreq
+            axes[5].axvspan(start_time, end_time, color='lightcoral', alpha=0.3)
+    if len(fifth_derivative) > 0:
+        max_abs_d5 = np.max(np.abs(fifth_derivative))
+        if max_abs_d5 > 0:
+            axes[5].set_ylim(-max_abs_d5 * 1.1, max_abs_d5 * 1.1)
+
+    # Plot Sixth Derivative
+    axes[6].plot(times_array[6:], sixth_derivative, label='Sixth Derivative', color='indigo')
+    axes[6].set_title('Sixth Derivative')
+    axes[6].set_ylabel('d^6(Amplitude)/dt^6')
+    axes[6].set_xlabel('Time (s)') # X-label only on the very last plot
+    axes[6].grid(True, alpha=0.5)
+    axes[6].legend(loc='upper right')
+    if pulse_starts_samples is not None and pulse_ends_samples is not None and \
+       len(pulse_starts_samples) > 0 and sfreq is not None:
+        for start_samp, end_samp in zip(pulse_starts_samples, pulse_ends_samples):
+            start_time = start_samp / sfreq
+            end_time = end_samp / sfreq
+            axes[6].axvspan(start_time, end_time, color='lightcoral', alpha=0.3)
+    if len(sixth_derivative) > 0:
+        max_abs_d6 = np.max(np.abs(sixth_derivative))
+        if max_abs_d6 > 0:
+            axes[6].set_ylim(-max_abs_d6 * 1.1, max_abs_d6 * 1.1)
+
+    # Plot Seventh Derivative
+    axes[7].plot(times_array[7:], seventh_derivative, label='Seventh Derivative', color='gold')
+    axes[7].set_title('Seventh Derivative')
+    axes[7].set_ylabel('d^7(Amplitude)/dt^7')
+    axes[7].grid(True, alpha=0.5)
+    axes[7].legend(loc='upper right')
+    if pulse_starts_samples is not None and pulse_ends_samples is not None and \
+       len(pulse_starts_samples) > 0 and sfreq is not None:
+        for start_samp, end_samp in zip(pulse_starts_samples, pulse_ends_samples):
+            start_time = start_samp / sfreq
+            end_time = end_samp / sfreq
+            axes[7].axvspan(start_time, end_time, color='lightcoral', alpha=0.3)
+    if len(seventh_derivative) > 0:
+        max_abs_d7 = np.max(np.abs(seventh_derivative))
+        if max_abs_d7 > 0:
+            axes[7].set_ylim(-max_abs_d7 * 1.1, max_abs_d7 * 1.1)
+
+    # Plot Eighth Derivative
+    axes[8].plot(times_array[8:], eighth_derivative, label='Eighth Derivative', color='darkviolet')
+    axes[8].set_title('Eighth Derivative')
+    axes[8].set_ylabel('d^8(Amplitude)/dt^8')
+    axes[8].set_xlabel('Time (s)') # X-label only on the very last plot
+    axes[8].grid(True, alpha=0.5)
+    axes[8].legend(loc='upper right')
+    if pulse_starts_samples is not None and pulse_ends_samples is not None and \
+       len(pulse_starts_samples) > 0 and sfreq is not None:
+        for start_samp, end_samp in zip(pulse_starts_samples, pulse_ends_samples):
+            start_time = start_samp / sfreq
+            end_time = end_samp / sfreq
+            axes[8].axvspan(start_time, end_time, color='lightcoral', alpha=0.3)
+    if len(eighth_derivative) > 0:
+        max_abs_d8 = np.max(np.abs(eighth_derivative))
+        if max_abs_d8 > 0:
+            axes[8].set_ylim(-max_abs_d8 * 1.1, max_abs_d8 * 1.1)
+
+
     # Disable y-axis autoscaling for derivative plots after initial setup.
     # This prevents y-panning while allowing y-zooming via specific zoom tools.
-    axes[1].autoscale(enable=False, axis='y')
-    axes[2].autoscale(enable=False, axis='y')
-
+    # Apply to all derivative axes
+    for i in range(1, 9): # axes[1] through axes[8]
+        if len(axes[i].lines) > 0 : # Check if plot is not empty
+             # Check if corresponding derivative data exists before trying to autoscale
+            if i == 1 and len(first_derivative) == 0: continue
+            if i == 2 and len(second_derivative) == 0: continue
+            if i == 3 and len(third_derivative) == 0: continue
+            if i == 4 and len(fourth_derivative) == 0: continue
+            if i == 5 and len(fifth_derivative) == 0: continue
+            if i == 6 and len(sixth_derivative) == 0: continue
+            if i == 7 and len(seventh_derivative) == 0: continue
+            if i == 8 and len(eighth_derivative) == 0: continue
+            axes[i].autoscale(enable=False, axis='y')
     plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust for suptitle
     # plt.show() will be called once in main
 
 # --- Main Execution Block (Corrected) ---
 if __name__ == '__main__':
+    # Ensure Matplotlib backend is suitable for interactive plots if not running in a specific environment
+    # For example, if running from a simple script, 'Qt5Agg' or 'TkAgg' might be needed.
+    # plt.switch_backend('Qt5Agg') # Or 'TkAgg', etc. Uncomment if plots are not interactive.
     try:
         # 1. Calculate Mean PSD and Initial Frequency Estimate
         mean_psd = psds.mean(axis=0)
@@ -1222,7 +1419,7 @@ if __name__ == '__main__':
             
             if len(signal_for_template) > 0:
                 # Call the final, automatic function.
-                pulse_starts_rel, pulse_ends_rel, template, mf_out, seed_peak_rel = find_stimulation_pulses_auto(
+                pulse_starts_rel, pulse_ends_rel, template, mf_out, seed_peak_rel, detected_centers_rel = find_stimulation_pulses_auto(
                     avg_signal_epoch=signal_for_template,
                     sfreq=sampleRate,
                     stim_freq_hz=final_est_stim_freq,
@@ -1234,11 +1431,15 @@ if __name__ == '__main__':
                 pulse_starts_abs, pulse_ends_abs = None, None # Add pulse_ends_abs back
                 current_template_for_plot = np.array([]) # Ensure it's an empty array, not None
                 seed_peak_abs_for_plot = None
+                detected_centers_abs_for_plot = None
 
                 if pulse_starts_rel is not None and len(pulse_starts_rel) > 0:
                     pulse_starts_abs = np.array(pulse_starts_rel) + offset_samples
                     pulse_ends_abs = np.array(pulse_ends_rel) + offset_samples
                     if seed_peak_rel is not None: seed_peak_abs_for_plot = seed_peak_rel + offset_samples
+                    if detected_centers_rel is not None:
+                        detected_centers_abs_for_plot = detected_centers_rel + offset_samples
+
 
                     signal_for_plot = data[strong_channel_idx_for_viz] if strong_channel_idx_for_viz is not None else avg_signal_full
                     ch_name_for_plot = raw.ch_names[strong_channel_idx_for_viz] if strong_channel_idx_for_viz is not None else "Average"
@@ -1276,7 +1477,8 @@ if __name__ == '__main__':
                             stim_freq_hz=final_est_stim_freq,
                             pulse_starts_samples=pulse_starts_abs.astype(int) if pulse_starts_abs is not None else np.array([]),
                             pulse_ends_samples=pulse_ends_abs.astype(int) if pulse_ends_abs is not None else np.array([]),
-                            sfreq=sampleRate
+                            sfreq=sampleRate,
+                            estimated_stim_centers_samples=detected_centers_abs_for_plot.astype(int) if detected_centers_abs_for_plot is not None else np.array([])
                         )
                     else:
                         print("Could not plot signal and derivatives due to missing data (avg_signal_full or raw.times).")
