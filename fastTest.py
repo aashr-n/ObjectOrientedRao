@@ -8,6 +8,7 @@ import mne
 import numpy as np
 import scipy.signal as signal
 import matplotlib.pyplot as plt
+import scipy.interpolate # Added for spline interpolation
 import matplotlib.gridspec as gridspec # For more control over subplots
 from mne.time_frequency import psd_array_multitaper
 from scipy.signal import find_peaks
@@ -572,22 +573,22 @@ def find_stimulation_pulses_auto(
           f"(prominence: {selected_peak_prominence:.2f}, value: {search_segment[seed_peak_location]:.2f}).")
 
     if debug_plots:
-        plt.figure(figsize=(15, 8)) # Adjusted for 3 plots now
+        fig_debug, axes_debug = plt.subplots(3, 1, figsize=(15, 10)) # Use plt.subplots for consistency
         
         # Plot 1: Seed peak finding
-        ax_seed = plt.subplot(4, 1, 1)
+        ax_seed = axes_debug[0]
         search_segment_times = np.arange(len(search_segment)) / sfreq
         ax_seed.plot(search_segment_times, search_segment, label='Initial Search Segment')
         # Plot all non-edge candidate peaks
         if candidate_peaks_indices_filtered.any():
             ax_seed.plot(search_segment_times[candidate_peaks_indices_filtered], search_segment[candidate_peaks_indices_filtered], 'o', label='Non-Edge Candidate Peaks', alpha=0.7)
         ax_seed.plot(search_segment_times[seed_peak_location], search_segment[seed_peak_location], 'rx', markersize=10, label='Chosen Seed Peak')
-        ax_seed.set_title(f'Step 1: Seed Peak Detection (Found at {seed_peak_location/sfreq:.3f}s within segment)')
+        ax_seed.set_title(f'Debug: Step 1 - Seed Peak Detection (Found at {seed_peak_location/sfreq:.3f}s within segment)')
         ax_seed.legend()
 
     # --- Step 2: Extract Template based on seed_peak_location and fixed window ---
     samples_before_peak = int(template_half_width_s * sfreq)
-    samples_after_peak = samples_before_peak # Symmetric window
+    samples_after_peak = samples_before_peak # Symmetric window for this strategy
     template_total_len = samples_before_peak + samples_after_peak
 
     if template_total_len <= 0:
@@ -644,20 +645,20 @@ def find_stimulation_pulses_auto(
 
     if debug_plots:
         # Plot 3: Final Template Waveform (Dynamic Segment)
-        ax_template_plot = plt.subplot(3, 1, 2) # Now subplot 2 of 3
+        ax_template_plot = axes_debug[1] # Use consistent axes from plt.subplots
         # Time axis for the dynamic template, centered
         dynamic_template_times = (np.arange(len(template_waveform)) - len(template_waveform)//2) / sfreq
         ax_template_plot.plot(dynamic_template_times, template_waveform, label=f'Final Template (Window: +/- {template_half_width_s * 1000:.2f} ms)')
         # Mark the prominent peak within the template
         time_of_peak_in_template_plot = (peak_offset_in_template - (len(template_waveform) // 2)) / sfreq
         ax_template_plot.axvline(time_of_peak_in_template_plot, color='lime', linestyle=':', linewidth=2, label=f'Prominent Peak in Template (New Effective Center)')
-        ax_template_plot.set_title('Step 2: Final Template Waveform')
+        ax_template_plot.set_title('Debug: Step 2 - Final Template Waveform')
         ax_template_plot.legend()
 
     # --- Step 4: Matched filter and final detection ---
     mf_kernel = template_waveform[::-1]
     matched_filter_output = np.convolve(avg_signal_epoch, mf_kernel, mode='same')
-
+    
     # MF threshold is removed as per request. We will find all peaks based on distance.
     mf_distance_samples = int(0.6 * period_samples)
     # This initial find_peaks call gives us all potential candidates, sorted by index.
@@ -771,15 +772,15 @@ def find_stimulation_pulses_auto(
 
     if debug_plots:
         # Plot 4: Matched Filter Output
-        ax_mf = plt.subplot(3, 1, 3) # Now subplot 3 of 3
+        ax_mf = axes_debug[2] # Use consistent axes from plt.subplots
         epoch_times = np.arange(len(avg_signal_epoch)) / sfreq
         ax_mf.plot(epoch_times, matched_filter_output, label='Matched Filter Output')
         if detected_pulse_centers.any():
             ax_mf.plot(epoch_times[detected_pulse_centers], matched_filter_output[detected_pulse_centers], 'rx', markersize=8, label='Final Detected Pulse Centers')
         # ax_mf.axhline(mf_peak_threshold, color='k', linestyle='--', label=f'MF Threshold ({mf_peak_percentile}th percentile)') # Threshold line removed
-        ax_mf.set_title('Step 4: Matched Filter Output and Detected Pulses')
+        ax_mf.set_title('Debug: Step 3 - Matched Filter Output and Detected Pulses')
         ax_mf.legend()
-        plt.tight_layout() # Apply layout
+        fig_debug.tight_layout() # Apply layout to the correct figure object
         # plt.show() # Removed: will be called once in main
 
     print(f"Identified {len(pulse_starts_samples)} stimulation pulses automatically.")
@@ -1147,23 +1148,29 @@ def plot_signal_and_derivatives(
         if max_abs_d4 > 0:
             axes[4].set_ylim(-max_abs_d4 * 1.1, max_abs_d4 * 1.1)
 
-    # Mark highest/lowest 4th derivative points around estimated stim centers
+    # Initialize legend flag for D4 gap spans on axes[0]
+    first_d4_gap_span_legend = True 
+
+    # Mark highest/lowest 4th derivative points on axes[4]
+    # and the gap between them on axes[0]
     if len(fourth_derivative) > 0 and \
        estimated_stim_centers_samples is not None and \
        len(estimated_stim_centers_samples) > 0 and \
        stim_freq_hz is not None and stim_freq_hz > 0 and \
        sfreq is not None:
-
-        period_samples = sfreq / stim_freq_hz
-        half_period_search_samples = int(period_samples / 2.0)
         first_max_marker_before = True
         first_min_marker_after = True
+        period_samples = sfreq / stim_freq_hz # Moved period_samples calculation inside the conditional block
+        half_period_search_samples = int(period_samples / 2.0) # Moved here as well
 
         for center_samp_abs_sig in estimated_stim_centers_samples:
             # Window 1: Before center (for max D4)
             # Signal indices for search: [center_samp_abs_sig - half_period_search_samples, center_samp_abs_sig]
             s1_start_sig = max(0, center_samp_abs_sig - half_period_search_samples)
             s1_end_sig = center_samp_abs_sig # Inclusive end for this logic step in signal time
+
+            time_of_d4_max_before_current_center = None
+            time_of_d4_min_after_current_center = None
 
             # Corresponding D4 indices (D4[i] corresponds to signal[i+4])
             d4_s1_start_idx = max(0, s1_start_sig - 4)
@@ -1180,6 +1187,7 @@ def plot_signal_and_derivatives(
                         axes[4].plot(times_array[time_idx_for_plot_max], 
                                      fourth_derivative[abs_idx_d4_max_in_d4_array], 
                                      'P', color='red', markersize=8, markeredgecolor='black', label=label)
+                        time_of_d4_max_before_current_center = times_array[time_idx_for_plot_max]
                         if first_max_marker_before: first_max_marker_before = False
             
             # Window 2: After center (for min D4)
@@ -1201,9 +1209,22 @@ def plot_signal_and_derivatives(
                         axes[4].plot(times_array[time_idx_for_plot_min],
                                      fourth_derivative[abs_idx_d4_min_in_d4_array],
                                      'X', color='blue', markersize=8, markeredgecolor='black', label=label)
+                        time_of_d4_min_after_current_center = times_array[time_idx_for_plot_min]
                         if first_min_marker_after: first_min_marker_after = False
+            
+            # Plot the gap span on axes[0] if both points were found
+            if time_of_d4_max_before_current_center is not None and \
+               time_of_d4_min_after_current_center is not None and \
+               time_of_d4_max_before_current_center < time_of_d4_min_after_current_center:
+                label_gap_span = "D4 Extrema Gap" if first_d4_gap_span_legend else "_nolegend_"
+                axes[0].axvspan(time_of_d4_max_before_current_center, time_of_d4_min_after_current_center,
+                                color='mediumseagreen', alpha=0.35, label=label_gap_span)
+                if first_d4_gap_span_legend: first_d4_gap_span_legend = False
+
+        # Update legends if relevant markers/spans were added
         if not first_max_marker_before or not first_min_marker_after: # if any marker was plotted
-            axes[4].legend(loc='upper right') # Update legend
+            axes[4].legend(loc='upper right') # Update legend for axes[4]
+        axes[0].legend(loc='upper right') # Update legend for axes[0] if D4 spans were added
 
     # Plot Fifth Derivative
     axes[5].plot(times_array[5:], fifth_derivative, label='Fifth Derivative', color='teal')
@@ -1293,6 +1314,260 @@ def plot_signal_and_derivatives(
             axes[i].autoscale(enable=False, axis='y')
     plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust for suptitle
     # plt.show() will be called once in main
+
+# --- New Plotting function for signal with D4 Gaps and Overlaps ---
+def plot_signal_with_d4_gaps_and_overlaps(
+    signal_data_to_plot,
+    times_array,
+    sfreq,
+    estimated_stim_centers_samples,
+    stim_freq_hz,
+    channel_name="Signal"
+):
+    """
+    Plots a signal with D4 Extrema Gaps highlighted. Overlapping regions of these
+    gaps are shown in a different color.
+    """
+    if signal_data_to_plot is None or len(signal_data_to_plot) == 0:
+        print("plot_signal_with_d4_gaps_and_overlaps: No signal data to plot.")
+        return
+    if estimated_stim_centers_samples is None or len(estimated_stim_centers_samples) == 0:
+        print("plot_signal_with_d4_gaps_and_overlaps: No estimated stim centers provided.")
+        return
+    if stim_freq_hz is None or stim_freq_hz <= 0:
+        print("plot_signal_with_d4_gaps_and_overlaps: Invalid stim_freq_hz.")
+        return
+
+    # Calculate 4th derivative of the signal_data_to_plot
+    d1 = np.diff(signal_data_to_plot)
+    d2 = np.diff(d1) if len(d1) > 0 else np.array([])
+    d3 = np.diff(d2) if len(d2) > 0 else np.array([])
+    fourth_derivative_sig = np.diff(d3) if len(d3) > 0 else np.array([])
+
+    if len(fourth_derivative_sig) == 0:
+        print("plot_signal_with_d4_gaps_and_overlaps: Could not compute 4th derivative.")
+        return
+
+    plt.figure(figsize=(18, 7))
+    plt.plot(times_array, signal_data_to_plot, label=f'{channel_name} Time Series', color='cornflowerblue', alpha=0.8)
+
+    d4_gaps = [] # List to store (start_time, end_time) of each D4 gap
+    period_samples = sfreq / stim_freq_hz
+    half_period_search_samples = int(period_samples / 2.0)
+
+    for center_samp_abs_sig in estimated_stim_centers_samples:
+        time_of_d4_max_before = None
+        time_of_d4_min_after = None
+
+        # Window 1: Before center (for max D4)
+        s1_start_sig = max(0, center_samp_abs_sig - half_period_search_samples)
+        s1_end_sig = center_samp_abs_sig
+        d4_s1_start_idx = max(0, s1_start_sig - 4)
+        d4_s1_end_idx = max(0, s1_end_sig - 4)
+        if d4_s1_start_idx <= d4_s1_end_idx and d4_s1_end_idx < len(fourth_derivative_sig):
+            segment1_d4 = fourth_derivative_sig[d4_s1_start_idx : d4_s1_end_idx + 1]
+            if len(segment1_d4) > 0:
+                idx_max_local_d4 = np.argmax(segment1_d4)
+                abs_idx_d4_max_in_d4_array = d4_s1_start_idx + idx_max_local_d4
+                time_idx_for_plot_max = abs_idx_d4_max_in_d4_array + 4
+                if 0 <= time_idx_for_plot_max < len(times_array):
+                    time_of_d4_max_before = times_array[time_idx_for_plot_max]
+
+        # Window 2: After center (for min D4)
+        s2_start_sig = center_samp_abs_sig
+        s2_end_sig = min(len(signal_data_to_plot)-1, center_samp_abs_sig + half_period_search_samples)
+        d4_s2_start_idx = max(0, s2_start_sig - 4)
+        d4_s2_end_idx = max(0, s2_end_sig - 4)
+        if d4_s2_start_idx <= d4_s2_end_idx and d4_s2_end_idx < len(fourth_derivative_sig):
+            segment2_d4 = fourth_derivative_sig[d4_s2_start_idx : d4_s2_end_idx + 1]
+            if len(segment2_d4) > 0:
+                idx_min_local_d4 = np.argmin(segment2_d4)
+                abs_idx_d4_min_in_d4_array = d4_s2_start_idx + idx_min_local_d4
+                time_idx_for_plot_min = abs_idx_d4_min_in_d4_array + 4
+                if 0 <= time_idx_for_plot_min < len(times_array):
+                    time_of_d4_min_after = times_array[time_idx_for_plot_min]
+
+        if time_of_d4_max_before is not None and time_of_d4_min_after is not None and \
+           time_of_d4_max_before < time_of_d4_min_after:
+            d4_gaps.append((time_of_d4_max_before, time_of_d4_min_after))
+
+    # Plot individual D4 Gaps
+    first_d4_gap_plot = True
+    for start_t, end_t in d4_gaps:
+        label = "D4 Extrema Gap" if first_d4_gap_plot else "_nolegend_"
+        plt.axvspan(start_t, end_t, color='mediumseagreen', alpha=0.35, label=label)
+        if first_d4_gap_plot: first_d4_gap_plot = False
+
+    # Identify and plot overlapping regions
+    if len(d4_gaps) > 1:
+        events = []
+        for start_t, end_t in d4_gaps:
+            events.append((start_t, 1)) # 1 for start event
+            events.append((end_t, -1))  # -1 for end event
+        events.sort()
+
+        active_overlap_count = 0
+        last_time = events[0][0]
+        first_overlap_plot = True
+        for i in range(len(events)):
+            current_time, type = events[i]
+            if current_time > last_time and active_overlap_count >= 2:
+                label = "Overlapping D4 Gaps" if first_overlap_plot else "_nolegend_"
+                plt.axvspan(last_time, current_time, color='yellow', alpha=0.5, label=label)
+                if first_overlap_plot: first_overlap_plot = False
+            active_overlap_count += type
+            last_time = current_time
+
+    plt.xlabel('Time (s)')
+    plt.ylabel('Amplitude')
+    plt.title(f'Time Series of {channel_name} with D4 Extrema Gaps (Overlaps in Yellow)')
+    plt.legend(loc='upper right')
+    plt.grid(True, alpha=0.5)
+    plt.tight_layout()
+
+# --- New Plotting function for Signal with Interpolated D4 Gaps ---
+def plot_signal_with_interpolated_d4_gaps(
+    signal_data_to_plot,
+    times_array,
+    sfreq,
+    estimated_stim_centers_samples,
+    stim_freq_hz,
+    channel_name="Signal"
+):
+    """
+    Plots a signal, highlighting D4 Extrema Gaps and showing the signal
+    with cubic/linear spline interpolation applied within these gaps.
+    """
+    if signal_data_to_plot is None or len(signal_data_to_plot) == 0 or \
+       estimated_stim_centers_samples is None or len(estimated_stim_centers_samples) == 0 or \
+       stim_freq_hz is None or stim_freq_hz <= 0:
+        print("plot_signal_with_interpolated_d4_gaps: Insufficient data provided.")
+        return
+
+    # Calculate 4th derivative of the signal_data_to_plot
+    d1 = np.diff(signal_data_to_plot)
+    d2 = np.diff(d1) if len(d1) > 0 else np.array([])
+    d3 = np.diff(d2) if len(d2) > 0 else np.array([])
+    fourth_derivative_sig = np.diff(d3) if len(d3) > 0 else np.array([])
+
+    if len(fourth_derivative_sig) == 0:
+        print("plot_signal_with_interpolated_d4_gaps: Could not compute 4th derivative.")
+        return
+
+    signal_copy_interpolated = signal_data_to_plot.copy()
+    d4_gap_times_for_plot = [] # To store (start_time, end_time) for axvspan
+
+    period_samples = sfreq / stim_freq_hz
+    half_period_search_samples = int(period_samples / 2.0)
+
+    for center_samp_abs_sig in estimated_stim_centers_samples:
+        time_of_d4_max_before_s, time_of_d4_min_after_s = None, None
+        
+        # --- Find D4 max before center ---
+        s1_start_sig = max(0, center_samp_abs_sig - half_period_search_samples)
+        s1_end_sig = center_samp_abs_sig
+        d4_s1_start_idx = max(0, s1_start_sig - 4)
+        d4_s1_end_idx = max(0, s1_end_sig - 4)
+        if d4_s1_start_idx <= d4_s1_end_idx and d4_s1_end_idx < len(fourth_derivative_sig):
+            segment1_d4 = fourth_derivative_sig[d4_s1_start_idx : d4_s1_end_idx + 1]
+            if len(segment1_d4) > 0:
+                idx_max_local_d4 = np.argmax(segment1_d4)
+                abs_idx_d4_max_in_d4_array = d4_s1_start_idx + idx_max_local_d4
+                time_idx_for_plot_max = abs_idx_d4_max_in_d4_array + 4
+                if 0 <= time_idx_for_plot_max < len(times_array):
+                    time_of_d4_max_before_s = times_array[time_idx_for_plot_max]
+
+        # --- Find D4 min after center ---
+        s2_start_sig = center_samp_abs_sig
+        s2_end_sig = min(len(signal_data_to_plot)-1, center_samp_abs_sig + half_period_search_samples)
+        d4_s2_start_idx = max(0, s2_start_sig - 4)
+        d4_s2_end_idx = max(0, s2_end_sig - 4)
+        if d4_s2_start_idx <= d4_s2_end_idx and d4_s2_end_idx < len(fourth_derivative_sig):
+            segment2_d4 = fourth_derivative_sig[d4_s2_start_idx : d4_s2_end_idx + 1]
+            if len(segment2_d4) > 0:
+                idx_min_local_d4 = np.argmin(segment2_d4)
+                abs_idx_d4_min_in_d4_array = d4_s2_start_idx + idx_min_local_d4
+                time_idx_for_plot_min = abs_idx_d4_min_in_d4_array + 4
+                if 0 <= time_idx_for_plot_min < len(times_array):
+                    time_of_d4_min_after_s = times_array[time_idx_for_plot_min]
+        
+        if time_of_d4_max_before_s is not None and time_of_d4_min_after_s is not None and \
+           time_of_d4_max_before_s < time_of_d4_min_after_s:
+            
+            gap_start_samp = int(time_of_d4_max_before_s * sfreq)
+            gap_end_samp = int(time_of_d4_min_after_s * sfreq)
+            d4_gap_times_for_plot.append((time_of_d4_max_before_s, time_of_d4_min_after_s))
+
+            if gap_end_samp <= gap_start_samp: continue 
+
+            # --- Interpolation for this gap ---
+            x_known_samples, y_known_values = [], []
+            num_pts_each_side = 2 # Number of points to try to get from each side of the gap
+
+            for i in range(num_pts_each_side, 0, -1): # Points before: gap_start-2, gap_start-1
+                idx = gap_start_samp - i
+                if idx >= 0:
+                    x_known_samples.append(idx)
+                    y_known_values.append(signal_data_to_plot[idx])
+            
+            for i in range(1, num_pts_each_side + 1): # Points after: gap_end+1, gap_end+2
+                idx = gap_end_samp + i
+                if idx < len(signal_data_to_plot):
+                    x_known_samples.append(idx)
+                    y_known_values.append(signal_data_to_plot[idx])
+            
+            unique_x_indices = np.unique(x_known_samples, return_index=True)[1]
+            x_known_samples = np.array(x_known_samples)[unique_x_indices]
+            y_known_values = np.array(y_known_values)[unique_x_indices]
+            
+            # Sort by sample index
+            sort_order = np.argsort(x_known_samples)
+            x_known_samples = x_known_samples[sort_order]
+            y_known_values = y_known_values[sort_order]
+
+            samples_to_interpolate = np.arange(gap_start_samp, gap_end_samp + 1)
+            if len(samples_to_interpolate) == 0: continue
+
+            interpolated_segment = None
+            interp_kind = 'linear'
+            if len(x_known_samples) >= 4: interp_kind = 'cubic'
+            elif len(x_known_samples) < 2: 
+                print(f"Warning: Not enough points ({len(x_known_samples)}) for any interpolation at gap starting {time_of_d4_max_before_s:.3f}s. Skipping.")
+                continue
+            
+            try:
+                interp_func = scipy.interpolate.interp1d(x_known_samples, y_known_values, kind=interp_kind, bounds_error=False, fill_value=np.nan)
+                interpolated_segment = interp_func(samples_to_interpolate)
+                if np.isnan(interpolated_segment).any(): # Fallback if cubic produced NaNs (e.g. extrapolation)
+                    if interp_kind == 'cubic' and len(x_known_samples) >= 2: # Try linear if cubic failed
+                        interp_func_lin = scipy.interpolate.interp1d(x_known_samples, y_known_values, kind='linear', bounds_error=False, fill_value=np.nan)
+                        interpolated_segment = interp_func_lin(samples_to_interpolate)
+                
+                valid_interp_mask = ~np.isnan(interpolated_segment)
+                if np.any(valid_interp_mask):
+                     signal_copy_interpolated[samples_to_interpolate[valid_interp_mask]] = interpolated_segment[valid_interp_mask]
+                else:
+                    print(f"Warning: Interpolation resulted in all NaNs for gap at {time_of_d4_max_before_s:.3f}s.")
+            except ValueError as e:
+                print(f"Warning: Interpolation error for gap at {time_of_d4_max_before_s:.3f}s: {e}")
+
+    # Plotting
+    plt.figure(figsize=(18, 7))
+    plt.plot(times_array, signal_data_to_plot, label=f'Original {channel_name}', color='gray', alpha=0.4, zorder=1)
+    plt.plot(times_array, signal_copy_interpolated, label=f'Interpolated {channel_name}', color='cornflowerblue', zorder=2)
+
+    first_gap_span_plot = True
+    for start_t, end_t in d4_gap_times_for_plot:
+        label = "D4 Extrema Gap (Interpolated Region)" if first_gap_span_plot else "_nolegend_"
+        plt.axvspan(start_t, end_t, color='lightgreen', alpha=0.3, label=label, zorder=0)
+        if first_gap_span_plot: first_gap_span_plot = False
+    
+    plt.xlabel('Time (s)')
+    plt.ylabel('Amplitude')
+    plt.title(f'Time Series of {channel_name} with D4 Gaps Interpolated')
+    plt.legend(loc='upper right')
+    plt.grid(True, alpha=0.5)
+    plt.tight_layout()
 
 # --- Main Execution Block (Corrected) ---
 if __name__ == '__main__':
@@ -1482,6 +1757,28 @@ if __name__ == '__main__':
                         )
                     else:
                         print("Could not plot signal and derivatives due to missing data (avg_signal_full or raw.times).")
+                    
+                    # Call the new plot for D4 gaps on the specific signal_for_plot
+                    plot_signal_with_d4_gaps_and_overlaps(
+                        signal_data_to_plot=signal_for_plot,
+                        times_array=raw.times,
+                        sfreq=sampleRate,
+                        estimated_stim_centers_samples=detected_centers_abs_for_plot.astype(int) if detected_centers_abs_for_plot is not None else np.array([]),
+                        stim_freq_hz=final_est_stim_freq,
+                        channel_name=ch_name_for_plot
+                    )
+                    
+                    # Call the new plot for signal with interpolated D4 gaps
+                    plot_signal_with_interpolated_d4_gaps(
+                        signal_data_to_plot=signal_for_plot,
+                        times_array=raw.times,
+                        sfreq=sampleRate,
+                        estimated_stim_centers_samples=detected_centers_abs_for_plot.astype(int) if detected_centers_abs_for_plot is not None else np.array([]),
+                        stim_freq_hz=final_est_stim_freq,
+                        channel_name=ch_name_for_plot
+                    )
+
+
                 else: # No pulses identified (pulse_starts_rel is None or empty)
                     print("No pulses identified by automatic function, or template generation failed. Skipping full results plot.")
                     # You could optionally plot just the raw signal here if desired, e.g.:
