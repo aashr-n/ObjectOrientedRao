@@ -29,17 +29,28 @@ mne.set_log_level('WARNING')
 
     # Open the file selection dialog
 file_path = filedialog.askopenfilename(
-    title="Select an EEG .fif file",
-    filetypes=[("FIF files", "*.fif"), ("All files", "*.*")]
+    title="Select an EEG file (.fif or .edf)",
+    filetypes=[("EEG files", "*.fif *.edf"), ("FIF files", "*.fif"), ("EDF files", "*.edf"), ("All files", "*.*")]
     )
     
 if not file_path:
     print("No file was selected. Exiting the program.")
     raise SystemExit        
-print(f"Loading selected file: {file_path}")
 
 # Load the data into memory for processing
-raw = mne.io.read_raw_fif(file_path, preload=True)
+print(f"Selected file: {file_path}")
+
+file_extension = os.path.splitext(file_path)[1].lower()
+
+if file_extension == '.fif':
+    print(f"Loading .fif file: {file_path}")
+    raw = mne.io.read_raw_fif(file_path, preload=True)
+elif file_extension == '.edf':
+    print(f"Loading .edf file: {file_path}")
+    raw = mne.io.read_raw_edf(file_path, preload=True, verbose='WARNING')
+else:
+    print(f"Unsupported file type: {file_extension}. Please select a .fif or .edf file.")
+    raise SystemExit
 
 ### Parameters first
 #  (gonna straight copy from matlab and then move from there)

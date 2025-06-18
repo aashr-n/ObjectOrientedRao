@@ -18,8 +18,8 @@ USE_DEFAULT_TEST_PATHS = True # Set to False to use file dialogs
 
 # --- Define Default Paths (EDIT THESE FOR YOUR SYSTEM) ---
 if USE_DEFAULT_TEST_PATHS:
-    DEFAULT_FIF_FILE_PATH = "/Users/aashray/Documents/ChangLab/RCS04_tr_103_eeg_raw.fif" # Replace with your actual .fif path
-    DEFAULT_NPZ_FILE_PATH = "/Users/aashray/Documents/ChangLab/RCS04_tr_103_eeg_raw_psds.npz" # Replace with your actual .npz path
+    DEFAULT_EEG_FILE_PATH = "/Users/aashray/Documents/ChangLab/RCS04_2443.edf" # Replace with your actual .fif or .edf path
+    DEFAULT_NPZ_FILE_PATH = "/Users/aashray/Documents/ChangLab/RCS04_2443_psds.npz" # Replace with your actual .npz path (associated with the EEG file)
 
 # --- 1. GUI to Select File (and get initial parameters) ---
 """
@@ -36,41 +36,55 @@ tk_root.withdraw()  # Hide the main window
 mne.set_log_level('WARNING')
 
 if USE_DEFAULT_TEST_PATHS:
-    fif_file_path = DEFAULT_FIF_FILE_PATH
+    eeg_file_path = DEFAULT_EEG_FILE_PATH
     npz_file_path = DEFAULT_NPZ_FILE_PATH
     print(f"--- USING DEFAULT TEST PATHS ---")
-    print(f"Default .fif file: {fif_file_path}")
+    print(f"Default EEG file: {eeg_file_path}")
     print(f"Default .npz file: {npz_file_path}")
-    if not os.path.exists(fif_file_path):
-        print(f"Error: Default .fif file not found at '{fif_file_path}'. Please check the path or set USE_DEFAULT_TEST_PATHS to False.")
+    if not os.path.exists(eeg_file_path):
+        print(f"Error: Default EEG file not found at '{eeg_file_path}'. Please check the path or set USE_DEFAULT_TEST_PATHS to False.")
         raise SystemExit
     if not os.path.exists(npz_file_path):
         print(f"Error: Default .npz file not found at '{npz_file_path}'. Please check the path or set USE_DEFAULT_TEST_PATHS to False.")
         raise SystemExit
 else:
-    # Step 1: Select the EEG .fif file (for metadata and raw data)
-    fif_file_path = filedialog.askopenfilename(
-        title="Select the EEG .fif file (for raw data and metadata)",
-        filetypes=[("FIF files", "*.fif"), ("All files", "*.*")]
+    # Step 1: Select the EEG file (for metadata and raw data)
+    eeg_file_path = filedialog.askopenfilename(
+        title="Select the EEG file (.fif or .edf) (for raw data and metadata)",
+        filetypes=[("EEG files", "*.fif *.edf"), ("FIF files", "*.fif"), ("EDF files", "*.edf"), ("All files", "*.*")]
         )
-    if not fif_file_path:
-        print("No .fif file was selected. Exiting the program.")
+    if not eeg_file_path:
+        print("No EEG file was selected. Exiting the program.")
         raise SystemExit
 
     # Step 2: Select the pre-calculated PSD .npz file
+    # Suggest a default .npz filename based on the selected EEG file
+    base_eeg_filename = os.path.splitext(os.path.basename(eeg_file_path))[0]
+    suggested_npz_filename = f"{base_eeg_filename}_psds.npz"
+    initial_dir_npz = os.path.dirname(eeg_file_path)
+
     npz_file_path = filedialog.askopenfilename(
         title="Select the pre-calculated PSD .npz file",
-        filetypes=[("NumPy archive files", "*.npz"), ("All files", "*.*")]
+        filetypes=[("NumPy archive files", "*.npz"), ("All files", "*.*")],
+        initialdir=initial_dir_npz,
+        initialfile=suggested_npz_filename
     )
     if not npz_file_path:
         print("No .npz file was selected. Exiting the program.")
         raise SystemExit
 
-print(f"Loading .fif file: {fif_file_path}")
-raw = mne.io.read_raw_fif(fif_file_path, preload=True)
+print(f"Loading EEG data from: {eeg_file_path}")
+file_extension = os.path.splitext(eeg_file_path)[1].lower()
+
+if file_extension == '.fif':
+    raw = mne.io.read_raw_fif(eeg_file_path, preload=True)
+elif file_extension == '.edf':
+    raw = mne.io.read_raw_edf(eeg_file_path, preload=True, verbose='WARNING')
+else:
+    print(f"Unsupported EEG file type: {file_extension}. Please select a .fif or .edf file.")
+    raise SystemExit
 
 print(f"Loading PSD data from: {npz_file_path}")
-
 try:
     psd_data_loaded = np.load(npz_file_path)
     psds = psd_data_loaded['psds']
@@ -78,7 +92,7 @@ try:
     print("PSDs and frequencies loaded successfully from .npz file.")
     if psds.shape[0] != len(raw.ch_names):
         print(f"Warning: Mismatch in channel count between .npz file ({psds.shape[0]}) "
-              f"and .fif file ({len(raw.ch_names)}). Ensure compatibility.")
+              f"and EEG file ({len(raw.ch_names)}). Ensure compatibility.")
     if freqs.ndim != 1:
         print(f"Warning: 'freqs' array from .npz is not 1-dimensional. This might cause issues.")
 except KeyError as e:
@@ -88,21 +102,19 @@ except Exception as e:
     print(f"Error loading .npz file '{npz_file_path}': {e}")
     raise SystemExit
 
-# Parameters derived from the loaded .fif file
+# Parameters derived from the loaded EEG file
 
 sampleRate = raw.info['sfreq']
 data = raw.get_data()                # shape (n_chan, n_samples)
 
 
 n_channels = len(raw.ch_names)
-
-n_chan_fif, _ = data.shape # Number of channels from .fif file
+n_chan_eeg, _ = data.shape # Number of channels from EEG file
 n_chan_psd = psds.shape[0]   # Number of channels from loaded PSDs
 
-print(f"The .fif recording has {n_chan_fif} channels. Loaded PSDs have {n_chan_psd} channels.")
-if n_chan_fif != n_chan_psd:
+print(f"The EEG recording has {n_chan_eeg} channels. Loaded PSDs have {n_chan_psd} channels.")
+if n_chan_eeg != n_chan_psd:
     print("WARNING: Channel count mismatch may affect channel-specific analyses if channel names/order differ.")
-
 # These parameters were for PSD calculation, which is now skipped.
 # They are kept commented in case any downstream code might have implicitly used them,
 # but they are not used for loading PSDs.
