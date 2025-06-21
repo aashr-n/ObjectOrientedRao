@@ -269,649 +269,6 @@ def calculate_single_peak_relative_prominence(psd_values, frequencies, peak_freq
     return rel_prom_val
 
 
-
-
-
-
-# --- 5. Visualize Stimulation Epoch with a Sliding Window ---
-def visualize_stim_epoch_with_sliding_window(
-    raw, 
-    stim_freq_hz, 
-    window_sec=1.0, 
-    step_sec=0.1, 
-    threshold_factor=1.5,
-    grace_period_sec=5.0,
-    strong_channel_idx=None
-    ) -> None: # Added return type hint for clarity
-    """
-    Uses a sliding window to find when the stimulation frequency is most prominent
-    and visualizes the result on a spectrogram.
-
-    Args:
-        raw (mne.io.Raw): The loaded MNE Raw object.
-        stim_freq_hz (float): The stimulation frequency to track.
-        window_sec (float): The duration of the sliding window in seconds.
-        step_sec (float): The amount to slide the window forward each step, in seconds.
-        threshold_factor (float): Multiplier for the median relative prominence to set
-                                  the detection threshold.
-        grace_period_sec (float): The maximum duration (in seconds) of sub-threshold
-                                  activity allowed before an epoch is considered ended.
-        strong_channel_idx (int, optional): Index of the channel to display in the
-                                            timeseries plot. Defaults to None.
-    """
-    print("Analyzing recording with a sliding window to find the stimulation epoch...")
-    data = raw.get_data()
-    sfreq = raw.info['sfreq']
-    n_channels, n_samples = data.shape
-    
-    # Convert window and step from seconds to samples
-    window_samples = int(window_sec * sfreq)
-    step_samples = int(step_sec * sfreq)
-    
-    window_starts = np.arange(0, n_samples - window_samples, step_samples)
-    
-    prominence_over_time = []
-
-    # Slide the window across the data
-    for start in window_starts:
-        end = start + window_samples
-        window_data = data[:, start:end]
-        
-        # Calculate PSD for this short window
-        psds, freqs = psd_array_multitaper(window_data, sfreq=sfreq, fmin=1, fmax=sfreq/2, verbose=False)
-        mean_psd = np.mean(psds, axis=0)
-        
-        # Find the frequency bin closest to our stimulation frequency
-        stim_freq_idx = np.argmin(np.abs(freqs - stim_freq_hz))
-        peak_power = mean_psd[stim_freq_idx]
-        
-        # Define neighborhood for relative prominence calculation
-        neighborhood_hz = 5.0
-        lower_bound = freqs[stim_freq_idx] - neighborhood_hz
-        upper_bound = freqs[stim_freq_idx] + neighborhood_hz
-        neighborhood_mask = (freqs >= lower_bound) & (freqs <= upper_bound) & (freqs != freqs[stim_freq_idx])
-        
-        mean_neighborhood_power = np.mean(mean_psd[neighborhood_mask]) if np.any(neighborhood_mask) else 1e-10
-        
-        relative_prominence = peak_power / mean_neighborhood_power
-        prominence_over_time.append(relative_prominence)
-    
-    # --- Visualization ---
-    if strong_channel_idx is not None:
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(18, 12), sharex=True, 
-                                           gridspec_kw={'height_ratios': [1, 2, 1]})
-        fig.suptitle(f'Stimulation Epoch Analysis (Freq: {stim_freq_hz:.2f} Hz, Chan: {raw.ch_names[strong_channel_idx]})', fontsize=16)
-    else:
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 10), sharex=True, 
-                                       gridspec_kw={'height_ratios': [1, 2]})
-        fig.suptitle(f'Stimulation Epoch Analysis (Detected Stim Freq: {stim_freq_hz:.2f} Hz)', fontsize=16)
-
-    # Plot 1: Relative Prominence over Time
-    window_times = window_starts / sfreq
-    ax1.plot(window_times, prominence_over_time, color='dodgerblue', label='Relative Prominence Score')
-    
-    # Calculate and plot a detection threshold
-    detection_threshold = np.median(prominence_over_time) * threshold_factor
-    ax1.axhline(detection_threshold, color='red', linestyle='--', label=f'Detection Threshold')
-    ax1.set_ylabel('Relative Prominence Score')
-    ax1.set_title('Stimulation Frequency Prominence Over Time')
-    ax1.legend()
-    ax1.grid(True, alpha=0.5)
-
-    # Plot 2: Spectrogram of the average signal
-    avg_signal = np.mean(data, axis=0)
-    f, t, Sxx = signal.spectrogram(avg_signal, fs=sfreq, nperseg=int(sfreq))
-    
-    # Use a logarithmic scale for power for better visualization
-    pcm = ax2.pcolormesh(t, f, 10 * np.log10(Sxx + np.finfo(float).eps), shading='gouraud', cmap='viridis')
-    ax2.set_ylabel('Frequency (Hz)')
-    ax2.set_xlabel('Time (s)')
-    ax2.set_title('Spectrogram with Detected Stimulation Epoch')
-    ax2.set_ylim(0, stim_freq_hz * 3) # Focus on relevant frequencies
-    fig.colorbar(pcm, ax=ax2, label='Power/Frequency (dB/Hz)')
-    
-    # Determine start and end of the stimulation epoch with grace period
-    is_active_window = np.array(prominence_over_time) > detection_threshold
-    active_window_indices = np.where(is_active_window)[0]
-
-    epoch_start_time = None
-    epoch_end_time = None
-
-    if len(active_window_indices) > 0:
-        epoch_start_time = window_times[active_window_indices[0]]
-        # This index points to the window_times array for the last window considered part of the epoch
-        current_epoch_last_active_window_idx_in_times = active_window_indices[0] 
-
-        for k in range(len(active_window_indices) - 1):
-            idx_current_active = active_window_indices[k]
-            idx_next_active = active_window_indices[k+1]
-            
-            time_diff_starts = window_times[idx_next_active] - window_times[idx_current_active]
-            
-            if time_diff_starts <= (grace_period_sec + window_sec):
-                current_epoch_last_active_window_idx_in_times = idx_next_active
-            else:
-                break # Gap is too large, epoch ended with window at idx_current_active
-        epoch_end_time = window_times[current_epoch_last_active_window_idx_in_times] + window_sec
-        
-        # Highlight on spectrogram
-        ax2.axvspan(epoch_start_time, epoch_end_time, color='orangered', alpha=0.3, 
-                    label=f'Detected Epoch ({epoch_start_time:.2f}s - {epoch_end_time:.2f}s)')
-    
-    # Plot 3: Timeseries of the strong channel if provided
-    if strong_channel_idx is not None and 'ax3' in locals():
-        channel_data_strong = raw.get_data(picks=[strong_channel_idx])[0]
-        times_raw = raw.times
-        ax3.plot(times_raw, channel_data_strong, color='purple', alpha=0.7, label=f'Channel: {raw.ch_names[strong_channel_idx]}')
-        if epoch_start_time is not None and epoch_end_time is not None:
-            ax3.axvspan(epoch_start_time, epoch_end_time, color='orangered', alpha=0.3)
-        ax3.set_ylabel('Amplitude')
-        ax3.set_xlabel('Time (s)')
-        ax3.set_title(f'Timeseries of Strong Channel ({raw.ch_names[strong_channel_idx]}) with Detected Epoch')
-        ax3.legend(loc='upper right')
-    ax2.legend()
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.show()
-
-
-# Helper function to get epoch times without immediate plotting
-def determine_stim_epoch_boundaries(
-    raw_obj,
-    stim_freq_hz,
-    window_sec=1.0,
-    step_sec=0.1,
-    threshold_factor=1.5,
-    grace_period_sec=5.0
-    ):
-    """
-    Determines the start and end times of the stimulation epoch.
-
-    Args:
-        raw_obj (mne.io.Raw): The loaded MNE Raw object.
-        stim_freq_hz (float): The stimulation frequency to track.
-        window_sec (float): Duration of the sliding window in seconds.
-        step_sec (float): Step size for the sliding window in seconds.
-        threshold_factor (float): Multiplier for median relative prominence for threshold.
-        grace_period_sec (float): Max duration of sub-threshold activity to bridge epochs.
-
-    Returns:
-        tuple: (epoch_start_time_s, epoch_end_time_s) or (None, None) if no epoch found.
-    """
-    print("\n--- Determining stimulation epoch boundaries ---")
-    data_full = raw_obj.get_data()
-    sfreq_val = raw_obj.info['sfreq']
-    _, n_samples_full = data_full.shape
-
-    window_samples_val = int(window_sec * sfreq_val)
-    step_samples_val = int(step_sec * sfreq_val)
-
-    window_starts_val = np.arange(0, n_samples_full - window_samples_val + 1, step_samples_val) # Ensure last window fits
-    if len(window_starts_val) == 0:
-        print("Warning: Recording too short for the specified window and step size.")
-        return None, None
-        
-    prominence_over_time_val = []
-
-    for start_idx in window_starts_val:
-        end_idx = start_idx + window_samples_val
-        window_data_val = data_full[:, start_idx:end_idx]
-        # Calculate PSD for this short window
-        psds_win, freqs_win = psd_array_multitaper(window_data_val, sfreq=sfreq_val, fmin=1, fmax=sfreq_val/2, verbose=False)
-        mean_psd_win = np.mean(psds_win, axis=0)
-        # Find the frequency bin closest to our stimulation frequency
-        stim_freq_idx_win = np.argmin(np.abs(freqs_win - stim_freq_hz))
-        peak_power_win = mean_psd_win[stim_freq_idx_win]
-        # Define neighborhood for relative prominence calculation
-        neighborhood_hz_val = 5.0 # Consistent with visualize_stim_epoch_with_sliding_window
-        lower_b = freqs_win[stim_freq_idx_win] - neighborhood_hz_val
-        upper_b = freqs_win[stim_freq_idx_win] + neighborhood_hz_val
-        neighborhood_mask_val = (freqs_win >= lower_b) & (freqs_win <= upper_b) & (freqs_win != freqs_win[stim_freq_idx_win])
-        mean_neighborhood_power_val = np.mean(mean_psd_win[neighborhood_mask_val]) if np.any(neighborhood_mask_val) else 1e-10
-        relative_prominence_val = peak_power_win / mean_neighborhood_power_val
-        prominence_over_time_val.append(relative_prominence_val)
-
-    # Use the same epoch determination logic as in visualize_stim_epoch_with_sliding_window
-    detection_threshold_val = np.median(prominence_over_time_val) * threshold_factor
-    is_active_window_val = np.array(prominence_over_time_val) > detection_threshold_val
-    active_window_indices_val = np.where(is_active_window_val)[0]
-    epoch_start_time_s, epoch_end_time_s = None, None # Initialize
-    window_times_val = window_starts_val / sfreq_val
-
-    if len(active_window_indices_val) > 0:
-        epoch_start_time_s = window_times_val[active_window_indices_val[0]]
-        current_epoch_last_active_window_idx_in_times = active_window_indices_val[0]
-        for k_idx in range(len(active_window_indices_val) - 1):
-            idx_current_active = active_window_indices_val[k_idx]
-            idx_next_active = active_window_indices_val[k_idx+1]
-            time_diff_starts = window_times_val[idx_next_active] - window_times_val[idx_current_active]
-            if time_diff_starts <= (grace_period_sec + window_sec): # Check against combined duration
-                current_epoch_last_active_window_idx_in_times = idx_next_active
-            else:
-                break 
-        epoch_end_time_s = window_times_val[current_epoch_last_active_window_idx_in_times] + window_sec
-        print(f"Determined epoch: {epoch_start_time_s:.2f}s - {epoch_end_time_s:.2f}s")
-    else:
-        print("Could not determine a distinct stimulation epoch. Template matching will use the full signal.")
-    return epoch_start_time_s, epoch_end_time_s
-
-
-
-# --- 6. Fully Automatic Pulse Identification Function ---
-def find_stimulation_pulses_auto(
-    avg_signal_epoch,
-    sfreq,
-    stim_freq_hz,
-    debug_plots=False 
-):
-    # total template length is 1 / (frac_of_train_interval * stim_freq_hz)
-    frac_of_train_interval = 4
-    template_half_width_s = 1.0 / (2.0 * stim_freq_hz * frac_of_train_interval) 
-
-    """
-    Automatically detects stimulation pulses with varying numbers of components
-    without requiring manual parameter tuning for the template shape.
-
-    It works by:
-    1. Finding a single "spiky" seed peak at the epoch onset.
-    2. Extracting a template from a fixed-width window around this
-       most prominent seed peak.
-    3. Creating a template from these dynamic boundaries.
-    4. Using this template in a matched filter to find all other pulses.
-
-    Args:
-        avg_signal_epoch (np.ndarray): The signal segment of the stimulation epoch.
-        sfreq (float): Sampling frequency.
-        stim_freq_hz (float): Estimated stimulation frequency.
-        debug_plots (bool): If True, will generate a plot showing intermediate
-                            steps of the automatic detection process.        
-        (Note: template_half_width_s is now calculated internally based on stim_freq_hz
-         to achieve a total template length of 1/(4*stim_freq_hz) seconds)
-
-    Returns:
-        tuple: (pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output, seed_peak_location_relative_to_epoch)
-    """
-    print("\n--- Running Fully Automatic Pulse Detection ---")
-
-    # --- Step 1: Find a single "spiky" seed peak to anchor our analysis ---
-    if stim_freq_hz <= 0:
-        print("Automatic Strategy: stim_freq_hz must be positive.")
-        return None, None, None, None, None
-        
-    # Define the search duration for the initial seed peak: +/- (1/2 * stim_freq_hz) around epoch start
-    # This means the window width is 1 / (2 * stim_freq_hz)
-    search_duration_s = 1.0 / (stim_freq_hz) ## change this if wanted
-    search_end_sample = min(int(search_duration_s * sfreq), len(avg_signal_epoch))
-    search_segment = avg_signal_epoch[:search_end_sample]
-
-    if len(search_segment) < 3:
-        print("Automatic Strategy: Epoch segment too short to find a seed peak.")
-        return None, None, None, None, None
-
-    # Find all candidate peaks in the absolute signal of the search_segment.
-    # We will select the most prominent POSITIVE peak.
-    # A minimal prominence might be useful to avoid picking up noise if the segment is flat,
-    # We'll use a very small prominence value for find_peaks to get candidates,
-    # and then select the one with the maximum calculated prominence.
-    candidate_peaks_indices, properties = find_peaks(search_segment, prominence=1e-9) # Operate on original signal to find positive peaks
-    
-    # The main debug plot (if enabled) will show the seed peak selection in its first panel.
-    if not candidate_peaks_indices.any():
-        print(f"Automatic Strategy: No candidate POSITIVE seed peaks found in the initial search segment (length {len(search_segment)} samples).")
-        return None, None, None, None, None
-
-    # Filter out peaks at the very edges of the search_segment
-    # A peak at index 0 or len(search_segment)-1 is an edge peak.
-    # We require peaks to have at least one sample on either side within the search_segment.
-    non_edge_mask = (candidate_peaks_indices > 0) & (candidate_peaks_indices < len(search_segment) - 1)
-    candidate_peaks_indices_filtered = candidate_peaks_indices[non_edge_mask]
-    candidate_prominences_filtered = properties["prominences"][non_edge_mask]
-
-    if not candidate_peaks_indices_filtered.any():
-        print(f"Automatic Strategy: All candidate POSITIVE peaks found were at the edges of the search segment ({len(search_segment)} samples long). No valid non-edge seed peak found.")
-        # Optionally, you could plot the search_segment here if debug_plots is True to see why
-        return None, None, None, None, None
-        
-    # Select the candidate peak that has the largest prominence value
-    if not candidate_prominences_filtered.any(): # Should be caught by the check above
-        print("Automatic Strategy: No prominences available for filtered candidate POSITIVE peaks.")
-        return None, None, None, None, None
-
-    idx_of_max_prominence_in_candidates = np.argmax(candidate_prominences_filtered)
-    # Get the actual sample index in search_segment (and thus avg_signal_epoch)
-    seed_peak_location = candidate_peaks_indices_filtered[idx_of_max_prominence_in_candidates]
-    selected_peak_prominence = candidate_prominences_filtered[idx_of_max_prominence_in_candidates]
-    
-    print(f"Found POSITIVE seed peak (max prominence in initial {search_duration_s:.3f}s segment) at sample {seed_peak_location} "
-          f"(prominence: {selected_peak_prominence:.2f}, value: {search_segment[seed_peak_location]:.2f}).")
-
-    if debug_plots:
-        fig_debug, axes_debug = plt.subplots(3, 1, figsize=(15, 10)) # Use plt.subplots for consistency
-        
-        # Plot 1: Seed peak finding
-        ax_seed = axes_debug[0]
-        search_segment_times = np.arange(len(search_segment)) / sfreq
-        ax_seed.plot(search_segment_times, search_segment, label='Initial Search Segment')
-        # Plot all non-edge candidate peaks
-        if candidate_peaks_indices_filtered.any():
-            ax_seed.plot(search_segment_times[candidate_peaks_indices_filtered], search_segment[candidate_peaks_indices_filtered], 'o', label='Non-Edge Candidate Peaks', alpha=0.7)
-        ax_seed.plot(search_segment_times[seed_peak_location], search_segment[seed_peak_location], 'rx', markersize=10, label='Chosen Seed Peak')
-        ax_seed.set_title(f'Debug: Step 1 - Seed Peak Detection (Found at {seed_peak_location/sfreq:.3f}s within segment)')
-        ax_seed.legend()
-
-    # --- Step 2: Extract Template based on seed_peak_location and fixed window ---
-    samples_before_peak = int(template_half_width_s * sfreq)
-    samples_after_peak = samples_before_peak # Symmetric window for this strategy
-    template_total_len = samples_before_peak + samples_after_peak
-
-    if template_total_len <= 0:
-        print(f"Automatic Strategy: Template total length is {template_total_len}. Check stim_freq_hz ({stim_freq_hz:.2f} Hz) and sfreq ({sfreq:.2f} Hz).")
-        return None, None, None, None, seed_peak_location # Return seed_peak_location even on failure for potential debugging
-
-    # Define window in avg_signal_epoch coordinates
-    window_start_abs = seed_peak_location - samples_before_peak
-    window_end_abs = seed_peak_location + samples_after_peak # Exclusive for slicing if used directly
-
-    # Extract the snippet, padding with zeros at the edges
-    template_waveform = np.zeros(template_total_len)
-    
-    # Source slice from avg_signal_epoch
-    src_start_in_epoch = max(0, window_start_abs)
-    src_end_in_epoch = min(len(avg_signal_epoch), window_end_abs)
-    
-    # Destination slice in template_waveform
-    dest_start_in_template = max(0, -window_start_abs) # If window_start_abs is negative
-    dest_end_in_template = dest_start_in_template + (src_end_in_epoch - src_start_in_epoch)
-
-    if dest_start_in_template < dest_end_in_template and dest_end_in_template <= template_total_len:
-        template_waveform[dest_start_in_template:dest_end_in_template] = avg_signal_epoch[src_start_in_epoch:src_end_in_epoch]
-    
-    # --- Scale the template waveform based on the seed peak amplitude ---
-    # The seed_peak_location is an absolute index in avg_signal_epoch.
-    # Its index within the extracted template_waveform is seed_peak_location - window_start_abs.
-    seed_peak_index_in_template = seed_peak_location - window_start_abs
-
-    # Ensure the index is valid within the extracted (potentially padded) template
-    if 0 <= seed_peak_index_in_template < len(template_waveform):
-        original_seed_amplitude = avg_signal_epoch[seed_peak_location]
-        template_peak_amplitude_at_seed_loc = template_waveform[seed_peak_index_in_template]
-
-        # Calculate scaling factor
-        scaling_factor = 1.0 # Default to no scaling
-        # Avoid division by zero or very small numbers
-        if np.abs(template_peak_amplitude_at_seed_loc) > 1e-9:
-             scaling_factor = original_seed_amplitude / template_peak_amplitude_at_seed_loc
-             template_waveform = template_waveform * scaling_factor
-             print(f"Scaled template waveform by factor: {scaling_factor:.4f}")
-        else:
-             print("Warning: Amplitude at seed peak location in template is near zero. Skipping template scaling.")
-    else:
-        print(f"Warning: Seed peak index ({seed_peak_index_in_template}) is outside template bounds ({len(template_waveform)}). Skipping template scaling.")
-
-    print(f"Extracted template of length {len(template_waveform)} samples around seed peak (window: +/- {template_half_width_s * 1000:.2f} ms).")
-
-    period_samples = int(sfreq / stim_freq_hz)
-    
-    peak_offset_in_template = 0 # Initialize
-    if len(template_waveform) > 0:
-        peak_offset_in_template = np.argmax(np.abs(template_waveform))
-
-    if debug_plots:
-        # Plot 3: Final Template Waveform (Dynamic Segment)
-        ax_template_plot = axes_debug[1] # Use consistent axes from plt.subplots
-        # Time axis for the dynamic template, centered
-        dynamic_template_times = (np.arange(len(template_waveform)) - len(template_waveform)//2) / sfreq
-        ax_template_plot.plot(dynamic_template_times, template_waveform, label=f'Final Template (Window: +/- {template_half_width_s * 1000:.2f} ms)')
-        # Mark the prominent peak within the template
-        time_of_peak_in_template_plot = (peak_offset_in_template - (len(template_waveform) // 2)) / sfreq
-        ax_template_plot.axvline(time_of_peak_in_template_plot, color='lime', linestyle=':', linewidth=2, label=f'Prominent Peak in Template (New Effective Center)')
-        ax_template_plot.set_title('Debug: Step 2 - Final Template Waveform')
-        ax_template_plot.legend()
-
-    # --- Step 4: Matched filter and final detection ---
-    mf_kernel = template_waveform[::-1]
-    matched_filter_output = np.convolve(avg_signal_epoch, mf_kernel, mode='same')
-    
-    # MF threshold is removed as per request. We will find all peaks based on distance.
-    mf_distance_samples = int(0.6 * period_samples)
-    # This initial find_peaks call gives us all potential candidates, sorted by index.
-    # The 'distance' parameter here helps to avoid picking multiple points from a single broad MF peak.
-    all_mf_candidates, _ = find_peaks(
-        matched_filter_output, height=None, distance=mf_distance_samples # height=None removes thresholding
-    )
-
-    if not all_mf_candidates.size > 0: # Check if array is not empty
-        print("Automatic Strategy: No pulses found after matched filtering (initial pass).")
-        return None, None, template_waveform, matched_filter_output, seed_peak_location
-
-    # --- New logic: Refine the first pulse based on seed_peak_location and leeway ---
-    print(f"Automatic Strategy: Initial detection found {len(all_mf_candidates)} pulses. Refining first pulse...")
-
-    # Tolerance: +/- (3/4) of a stimulation period duration, centered on seed_peak_location
-    final_detected_pulse_centers_list = []
-
-    # --- First Pulse: Directly use the seed_peak_location ---
-    if not (0 <= seed_peak_location < len(matched_filter_output)):
-        print(f"Automatic Strategy: seed_peak_location ({seed_peak_location}) is out of bounds "
-              f"for matched_filter_output (len: {len(matched_filter_output)}). Cannot set first pulse.")
-        return None, None, template_waveform, matched_filter_output, seed_peak_location
-
-    first_pulse_center = seed_peak_location
-    final_detected_pulse_centers_list.append(first_pulse_center)
-    print(f"Automatic Strategy: Set first pulse center to seed_peak_location: {first_pulse_center} "
-          f"(MF score at seed: {matched_filter_output[first_pulse_center]:.2f})")
-    last_confirmed_pulse_center = first_pulse_center
-
-    # --- Iteratively find subsequent pulses ---
-    # period_samples is already int(sfreq / stim_freq_hz)
-    tolerance_samples = int(round(period_samples /4.0)) # +/- 1/4th of a period
-
-    while True:
-        # --- Define search window for the next pulse ---
-        expected_next_center_ideal = last_confirmed_pulse_center + period_samples
-        
-        # Define search window
-        search_window_min = expected_next_center_ideal - tolerance_samples
-        search_window_max = expected_next_center_ideal + tolerance_samples
-
-        # Ensure search window is within signal bounds for matched_filter_output
-        # (also applies to avg_signal_epoch as they have the same length)
-        if search_window_min >= len(avg_signal_epoch):
-            print(f"Automatic Strategy: Search window for next pulse (min: {search_window_min}) is beyond signal length. Stopping search.")
-            break
-        
-        # Clip window to be within bounds of matched_filter_output
-        search_window_min_abs = max(0, search_window_min)
-        search_window_max_abs = min(len(avg_signal_epoch) - 1, search_window_max)
-
-        # --- Find the most prominent peak in avg_signal_epoch within this search window ---
-        current_search_sub_epoch = avg_signal_epoch[search_window_min_abs : search_window_max_abs + 1]
-        
-        if len(current_search_sub_epoch) < 3: # find_peaks needs at least 3 samples for non-edge peaks
-            print(f"Automatic Strategy: Search window segment (length {len(current_search_sub_epoch)}) is too short. Stopping search.")
-            break 
-
-        # Find positive-going peaks and select the one with max prominence in this window
-        local_peak_indices_in_sub_epoch, local_properties = find_peaks(current_search_sub_epoch, prominence=1e-9) # Small prominence to get candidates
-
-        if not local_peak_indices_in_sub_epoch.any():
-            print(f"Automatic Strategy: No initial peaks found in avg_signal_epoch within window "
-                  f"[{search_window_min_abs}, {search_window_max_abs}] around expected center {expected_next_center_ideal:.0f}. Stopping search.")
-            break
-        
-        # Filter out peaks at the very edges of the current_search_sub_epoch for robust prominence.
-        non_edge_mask_local = (local_peak_indices_in_sub_epoch > 0) & \
-                              (local_peak_indices_in_sub_epoch < len(current_search_sub_epoch) - 1)
-        
-        local_peak_indices_filtered = local_peak_indices_in_sub_epoch[non_edge_mask_local]
-        
-        if not local_peak_indices_filtered.any():
-            print(f"Automatic Strategy: All peaks in window [{search_window_min_abs}, {search_window_max_abs}] "
-                  f"were at the edges of the sub-segment. Cannot determine most prominent. Stopping search.")
-            break
-
-        local_prominences_filtered = local_properties["prominences"][non_edge_mask_local]
-        if not local_prominences_filtered.any(): # Should be caught by above check
-             print(f"Automatic Strategy: No prominences for non-edge peaks in window. Stopping search.")
-             break
-
-        idx_of_max_prom_in_local_peaks = np.argmax(local_prominences_filtered)
-        best_local_peak_offset = local_peak_indices_filtered[idx_of_max_prom_in_local_peaks]
-        
-        # Convert local index back to absolute index in avg_signal_epoch
-        next_pulse_center = search_window_min_abs + best_local_peak_offset
-        
-        # Safety check: ensure we are moving forward
-        if next_pulse_center <= last_confirmed_pulse_center:
-            print(f"Automatic Strategy: Newly found peak ({next_pulse_center}) is not after last confirmed peak ({last_confirmed_pulse_center}). Stopping.")
-            break
-        
-        final_detected_pulse_centers_list.append(next_pulse_center)
-        print(f"Automatic Strategy: Found next pulse at {next_pulse_center} (expected near {expected_next_center_ideal:.0f}, "
-              f"tolerance: +/- {tolerance_samples} samples, raw signal prominence: {local_prominences_filtered[idx_of_max_prom_in_local_peaks]:.2f})")
-        last_confirmed_pulse_center = next_pulse_center
-        
-    detected_pulse_centers = np.array(final_detected_pulse_centers_list)
-
-    # --- Calculate pulse start and end based on the (potentially refined) detected_pulse_centers ---
-    # For aligning the pulse window, we use the geometric center of the template,
-    # ensuring that detected_pulse_centers corresponds to the center of the highlighted artifact.
-    alignment_offset_in_template = len(template_waveform) // 2
-            
-    pulse_starts_samples = detected_pulse_centers - alignment_offset_in_template
-    # Ensure pulse_ends_samples correctly reflects the full length of template_waveform.
-    pulse_ends_samples = pulse_starts_samples + len(template_waveform)
-
-
-    if debug_plots:
-        # Plot 4: Matched Filter Output
-        ax_mf = axes_debug[2] # Use consistent axes from plt.subplots
-        epoch_times = np.arange(len(avg_signal_epoch)) / sfreq
-        ax_mf.plot(epoch_times, matched_filter_output, label='Matched Filter Output')
-        if detected_pulse_centers.any():
-            ax_mf.plot(epoch_times[detected_pulse_centers], matched_filter_output[detected_pulse_centers], 'rx', markersize=8, label='Final Detected Pulse Centers')
-        # ax_mf.axhline(mf_peak_threshold, color='k', linestyle='--', label=f'MF Threshold ({mf_peak_percentile}th percentile)') # Threshold line removed
-        ax_mf.set_title('Debug: Step 3 - Matched Filter Output and Detected Pulses')
-        ax_mf.legend()
-        fig_debug.tight_layout() # Apply layout to the correct figure object
-        # plt.show() # Removed: will be called once in main
-
-    print(f"Identified {len(pulse_starts_samples)} stimulation pulses automatically.")
-    return pulse_starts_samples, pulse_ends_samples, template_waveform, matched_filter_output, seed_peak_location, detected_pulse_centers
-
-
-# --- Plotting function for pulse identification results ---
-def plot_template_and_overlaid_pulses(
-    signal_to_plot,       # The time-domain signal (e.g., one channel or average)
-    times_array,          # Time vector for signal_to_plot
-    pulse_starts_samples, # Absolute start samples of pulses
-    pulse_ends_samples,   # Absolute end samples of pulses    
-    template_waveform,    # The template used for matching
-    sfreq,                # Sampling frequency
-    mean_signal_overall=None, # Default argument moved later
-    channel_name="Signal",# Name of the signal being plotted
-    stim_freq_hz=None,    # Estimated stimulation frequency (for title)
-    seed_peak_abs_sample=None # Absolute sample index of the seed peak
-):
-    """
-    Visualizes the derived template and the detected pulses overlaid on the time series.
-    Panel 1: The derived template waveform.
-    Panel 2: The signal with detected pulse durations highlighted.
-    """
-    fig, (ax_template, ax_signal) = plt.subplots(2, 1, figsize=(18, 10), sharex=False,
-                                               gridspec_kw={'height_ratios': [1, 2]})
-
-    title_str = f'Pulse Identification Results (Signal: {channel_name})'
-    if stim_freq_hz:
-        title_str = f'Pulse Identification Results (Est. Stim Freq: {stim_freq_hz:.2f} Hz, Signal: {channel_name})'
-    fig.suptitle(title_str, fontsize=16)
-
-    # panel 1 : template waveform
-    if template_waveform is not None and len(template_waveform) > 0:
-        template_time_axis = (np.arange(len(template_waveform)) - len(template_waveform) // 2) / sfreq # Centered
-        ax_template.plot(template_time_axis, template_waveform, color='darkorange', label='Derived Template Waveform')
-        ax_template.set_xlabel('Time relative to template center (s)')
-        ax_template.set_ylabel('Amplitude')
-        ax_template.set_title('Derived Template Waveform')
-        ax_template.legend(loc='upper right')
-    else:
-        ax_template.text(0.5, 0.5, "Template not available or empty",
-                         ha='center', va='center', transform=ax_template.transAxes, fontsize=12, color='grey')
-        ax_template.set_title('Derived Template Waveform (Not Available)')
-        ax_template.set_xlabel('Time relative to template center (s)')
-        ax_template.set_ylabel('Amplitude')
-    ax_template.grid(True, alpha=0.5)
-
-    # Panel 2: Signal with Overlaid Detected Pulses (using the template)
-    ax_signal.plot(times_array, signal_to_plot, label=f'Original Signal: {channel_name}', color='cornflowerblue', alpha=0.7)
-
-    if mean_signal_overall is not None and channel_name != "Average" and len(mean_signal_overall) == len(times_array):
-        ax_signal.plot(times_array, mean_signal_overall, label='Overall Mean Signal', color='grey', linestyle=':', alpha=0.6)
-
-    
-    if pulse_starts_samples is not None and len(pulse_starts_samples) > 0 and \
-       pulse_ends_samples is not None and len(pulse_starts_samples) == len(pulse_ends_samples):
-        # Ensure pulse_ends_samples is also valid
-
-        # Create a sorted list of all unique event points (starts and ends of pulses)
-        all_event_points = np.unique(np.concatenate((pulse_starts_samples, pulse_ends_samples)))
-        all_event_points.sort()
-
-        # Flags for legend entries
-        first_green_span = True
-        first_red_span = True
-
-        if len(all_event_points) > 1:
-            for i in range(len(all_event_points) - 1):
-                interval_start_sample = all_event_points[i]
-                interval_end_sample = all_event_points[i+1]
-
-                if interval_start_sample >= interval_end_sample: # Skip zero-duration or invalid intervals
-                    continue
-
-                # Determine how many original pulses cover the midpoint of this elementary interval
-                mid_point_sample = (interval_start_sample + interval_end_sample) / 2.0
-                overlap_count = 0
-                for k in range(len(pulse_starts_samples)):
-                    # A pulse k covers the midpoint if:
-                    # pulse_starts_samples[k] <= mid_point_sample < pulse_ends_samples[k]
-                    # Note: pulse_ends_samples is exclusive end for slicing, so use <
-                    if pulse_starts_samples[k] <= mid_point_sample and mid_point_sample < pulse_ends_samples[k]:
-                        overlap_count += 1
-                
-                # Convert interval samples to time for plotting
-                start_time = interval_start_sample / sfreq
-                end_time = interval_end_sample / sfreq
-
-                if overlap_count == 1:
-                    label = 'Detected Pulse Artifacts (No Overlap)' if first_green_span else '_nolegend_'
-                    ax_signal.axvspan(start_time, end_time, color='green', alpha=0.4, label=label)
-                    if first_green_span: first_green_span = False
-                elif overlap_count > 1:
-                    label = 'Overlapping Detected Artifacts' if first_red_span else '_nolegend_'
-                    ax_signal.axvspan(start_time, end_time, color='red', alpha=0.5, label=label)
-                    if first_red_span: first_red_span = False
-        else: # Fallback for very few event points (e.g., single pulse, no distinct intervals)
-            # This case might indicate an issue or a very simple scenario.
-            # For simplicity, plot all as green if this fallback is hit.
-            for i, (start_samp, end_samp) in enumerate(zip(pulse_starts_samples, pulse_ends_samples)):
-                start_time = start_samp / sfreq
-                end_time = end_samp / sfreq
-                ax_signal.axvspan(start_time, end_time, color='green', alpha=0.4, label='Detected Pulse Artifacts' if i == 0 else '_nolegend_')
-
-    # Plot the seed peak location if provided
-    if seed_peak_abs_sample is not None:
-        seed_peak_time = seed_peak_abs_sample / sfreq
-        ax_signal.plot(seed_peak_time, signal_to_plot[seed_peak_abs_sample], 'm*', markersize=12, label=f'Initial Seed Peak ({seed_peak_time:.3f}s)')
-
-    ax_signal.set_xlabel('Time (s)')
-    ax_signal.set_ylabel('Amplitude')
-    ax_signal.set_title(f'Time Series of {channel_name} with Highlighted Pulse Artifacts')
-    ax_signal.legend(loc='upper right')
-    ax_signal.grid(True, alpha=0.5)
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust rect for suptitle and bottom labels
-    # plt.show() # Removed: will be called once in main
-
 # --- Main Execution Block (Corrected) ---
 
 def plot_comparison_psds(
@@ -951,425 +308,276 @@ def plot_comparison_psds(
     plt.tight_layout()
     # plt.show() # Will be called once in main
 
-# --- New Plotting function for signal and its derivatives ---
-def plot_signal_and_derivatives(
-    signal_data,
-    times_array,
-    signal_name="Signal",
-    stim_freq_hz=None,
-    pulse_starts_samples=None,
-    pulse_ends_samples=None,
-    sfreq=None):
+
+# --- New Modular Functions for Dog Line Analysis ---
+
+def create_dog_line(channel_data, peak_detection_height=0):
     """
-    Plots the signal, its first derivative, and its second derivative.
-    All subplots will have linked x-axes.
+    Creates a "Dog Line" from the positive peaks of the third derivative of a signal.
 
     Args:
-        signal_data (np.ndarray): The 1D time series data.
-        times_array (np.ndarray): The corresponding time vector for the signal.
-        signal_name (str): Name of the signal for titles.
-        stim_freq_hz (float, optional): Estimated stimulation frequency for title.
-        pulse_starts_samples (np.ndarray, optional): Array of start samples for each detected pulse.
-        pulse_ends_samples (np.ndarray, optional): Array of end samples for each detected pulse.
-        sfreq (float, optional): Sampling frequency, required if pulse samples are provided.
-        signal_name (str): Name of the signal for titles.
+        channel_data (np.ndarray): The 1D raw data for a single channel.
+        peak_detection_height (float): The minimum height for detecting peaks on the
+            third derivative. A value of 0 will find all positive peaks.
+
+    Returns:
+        tuple: (dog_line, third_derivative, peak_indices) or (None, np.ndarray, None) if failed.
     """
-    if len(signal_data) != len(times_array):
-        print("Error in plot_signal_and_derivatives: signal_data and times_array must have the same length.")
-        return
-
-    # Calculate derivatives
-    first_derivative = np.diff(signal_data)
-    if len(first_derivative) > 0:
-        second_derivative = np.diff(first_derivative)
-        if len(second_derivative) > 0:
-            third_derivative = np.diff(second_derivative)
-            if len(third_derivative) > 0:
-                fourth_derivative = np.diff(third_derivative)
-            else: fourth_derivative = np.array([])
-        else: third_derivative, fourth_derivative = np.array([]), np.array([])
-    else:
-        first_derivative, second_derivative, third_derivative, fourth_derivative = np.array([]), np.array([]), np.array([]), np.array([])
-    fig, axes = plt.subplots(5, 1, figsize=(18, 20), sharex=True) # Original + 4 derivatives
+    # 1. Calculate the third derivative
+    third_derivative = np.diff(channel_data, n=3)
     
-    title_prefix = f'{signal_name} Analysis'
-    if stim_freq_hz:
-        title_prefix = f'{signal_name} Analysis (Est. Stim Freq: {stim_freq_hz:.2f} Hz)'
-    fig.suptitle(title_prefix, fontsize=16)
-
-    # Plot Original Signal
-    axes[0].plot(times_array, signal_data, label='Original Signal', color='royalblue')
-    axes[0].set_title('Original Time Series')
-    axes[0].set_ylabel('Amplitude')
-    axes[0].grid(True, alpha=0.5)
-    axes[0].legend(loc='upper right')
-    if pulse_starts_samples is not None and pulse_ends_samples is not None and \
-       len(pulse_starts_samples) > 0 and sfreq is not None:
-        first_pulse_span_legend_ax0 = True
-        for start_samp, end_samp in zip(pulse_starts_samples, pulse_ends_samples):
-            start_time = start_samp / sfreq
-            end_time = end_samp / sfreq
-            label = 'Detected Pulses' if first_pulse_span_legend_ax0 else '_nolegend_'
-            axes[0].axvspan(start_time, end_time, color='lightcoral', alpha=0.3, label=label)
-            if first_pulse_span_legend_ax0:
-                first_pulse_span_legend_ax0 = False
-        axes[0].legend(loc='upper right')
-
-    # Plot First Derivative
-    # np.diff reduces length by 1, so times_array[1:] aligns with the derivative
-    axes[1].plot(times_array[1:], first_derivative, label='First Derivative', color='forestgreen')
-    axes[1].set_title('First Derivative')
-    axes[1].set_ylabel('d(Amplitude)/dt')
-    axes[1].grid(True, alpha=0.5)
-    axes[1].legend(loc='upper right') # Legend for the derivative line itself
-    if len(first_derivative) > 0:
-        max_abs_d1 = np.max(np.abs(first_derivative))
-        if max_abs_d1 > 0: # Avoid setting ylim to [0,0] if derivative is flat zero
-            axes[1].set_ylim(-max_abs_d1 * 1.1, max_abs_d1 * 1.1) # Add 10% padding
-
-
-    # Plot Second Derivative
-    # np.diff applied twice reduces length by 2
-    axes[2].plot(times_array[2:], second_derivative, label='Second Derivative', color='darkorange')
-    axes[2].set_title('Second Derivative')
-    axes[2].set_ylabel('d^2(Amplitude)/dt^2')
-    axes[2].grid(True, alpha=0.5)
-    axes[2].legend(loc='upper right') # Legend for the derivative line itself
-    if len(second_derivative) > 0:
-        max_abs_d2 = np.max(np.abs(second_derivative))
-        if max_abs_d2 > 0: # Avoid setting ylim to [0,0]
-            axes[2].set_ylim(-max_abs_d2 * 1.1, max_abs_d2 * 1.1) # Add 10% padding
-
-    # Plot Third Derivative
-    axes[3].plot(times_array[3:], third_derivative, label='Third Derivative', color='purple')
-    axes[3].set_title('Third Derivative')
-    axes[3].set_ylabel('d^3(Amplitude)/dt^3')
-    axes[3].grid(True, alpha=0.5)
-    # Legend for D3 will be handled after potential burst plotting
-    if len(third_derivative) > 0:
-        max_abs_d3 = np.max(np.abs(third_derivative))
-        if max_abs_d3 > 0:
-            axes[3].set_ylim(-max_abs_d3 * 1.1, max_abs_d3 * 1.1)
+    # 2. Find all positive peaks on the third derivative
+    # Using a low height threshold to catch all positive peaks as requested.
+    peak_indices, _ = find_peaks(third_derivative, height=peak_detection_height)
     
-    # Oscillation burst detection and highlighting in 3rd derivative for strong channel
-    if "Average" not in signal_name and pulse_starts_samples is not None and \
-       len(pulse_starts_samples) > 0 and len(third_derivative) > 0 and sfreq is not None:
-        # --- HILBERT TRANSFORM ANALYSIS ON 3RD DERIVATIVE (NEW) ---
-        print(f"Analyzing 3rd derivative for bursts in channel: {signal_name} (using Hilbert Transform)")
-        d3_times = times_array[3:]
-        
-        # 1. Compute amplitude envelope using Hilbert transform
-        analytic_signal_d3 = signal.hilbert(third_derivative)
-        amplitude_envelope_d3 = np.abs(analytic_signal_d3)
-        
-        # 2. Define a threshold for burst detection (mean + N * std dev)
-        hilbert_threshold = np.mean(amplitude_envelope_d3) + 0.5 * np.std(amplitude_envelope_d3)
-        
-        # 3. Plot the envelope and threshold on the 3rd derivative subplot (axes[3])
-        axes[3].plot(d3_times, amplitude_envelope_d3, color='cyan', linestyle='--', 
-                     label='Hilbert Envelope (D3)', alpha=0.9)
-        axes[3].axhline(hilbert_threshold, color='lime', linestyle=':', linewidth=2, 
-                        label=f'Hilbert Threshold (D3)')
-        
-        # 4. Detect and highlight pulses where the envelope crosses the threshold
-        is_above_hilbert = amplitude_envelope_d3 > hilbert_threshold
-        is_above_padded_hilbert = np.concatenate(([False], is_above_hilbert, [False]))
-        hilbert_starts = np.where(np.diff(is_above_padded_hilbert.astype(int)) == 1)[0]
-        hilbert_ends = np.where(np.diff(is_above_padded_hilbert.astype(int)) == -1)[0]
-        
-        first_hilbert_burst_span = True
-        for start_idx, end_idx in zip(hilbert_starts, hilbert_ends):
-            if start_idx < len(d3_times) and end_idx < len(d3_times):
-                start_time, end_time = d3_times[start_idx], d3_times[end_idx]
-                label = "Hilbert-Detected Bursts" if first_hilbert_burst_span else "_nolegend_"
-                axes[3].axvspan(start_time, end_time, color='yellow', alpha=0.3, label=label)
-                if first_hilbert_burst_span: first_hilbert_burst_span = False
-        print(f"  Found {len(hilbert_starts)} bursts in D3 with Hilbert method.")
-        # --- END OF HILBERT ANALYSIS ---
-        # After all analysis on this axis, call legend to show all labels.
-        axes[3].legend(loc='upper right')
-    else: # If no burst analysis, ensure the default legend for the derivative line is there
-        axes[3].legend(loc='upper right')
+    if len(peak_indices) < 2:
+        print("Warning: Less than 2 positive peaks found on derivative; cannot create dog line.")
+        return None, third_derivative, peak_indices
 
-    # Plot Fourth Derivative
-    axes[4].plot(times_array[4:], fourth_derivative, label='Fourth Derivative', color='brown')
-    axes[4].set_title('Fourth Derivative')
-    axes[4].set_ylabel('d^4(Amplitude)/dt^4')
-    axes[4].set_xlabel('Time (s)') # X-label only on the last plot
-    axes[4].legend(loc='upper right')
-    if len(fourth_derivative) > 0:
-        max_abs_d4 = np.max(np.abs(fourth_derivative))
-        if max_abs_d4 > 0:
-            axes[4].set_ylim(-max_abs_d4 * 1.1, max_abs_d4 * 1.1)
-    axes[4].grid(True, alpha=0.5) # Grid after potential ylim adjustment
+    # 3. Perform linear interpolation and ensure the "Dog Line" is non-negative
+    peak_values = third_derivative[peak_indices]
+    interp_func = scipy.interpolate.interp1d(
+        peak_indices, peak_values, kind='linear', bounds_error=False, fill_value="extrapolate"
+    )
+    x_full_derivative = np.arange(len(third_derivative))
+    dog_line_raw = interp_func(x_full_derivative)
+    dog_line = np.maximum(dog_line_raw, 0) # Clip at zero
 
+    return dog_line, third_derivative, peak_indices
 
-    # Disable y-axis autoscaling for derivative plots after initial setup.
-    # This prevents y-panning while allowing y-zooming via specific zoom tools.
-    # Apply to all derivative axes
-    for i in range(1, 5): # axes[1] through axes[4]
-        if len(axes[i].lines) > 0 : # Check if plot is not empty
-             # Check if corresponding derivative data exists before trying to autoscale
-            if i == 1 and len(first_derivative) == 0: continue
-            if i == 2 and len(second_derivative) == 0: continue
-            if i == 3 and len(third_derivative) == 0: continue
-            if i == 4 and len(fourth_derivative) == 0: continue
-            axes[i].autoscale(enable=False, axis='y')
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust for suptitle
-    # plt.show() will be called once in main
-
-# --- New Plotting function for signal with D4 Gaps and Overlaps ---
-def plot_signal_with_d4_gaps_and_overlaps(
-    signal_data_to_plot,
-    times_array,
-    sfreq,
-    estimated_stim_centers_samples,
-    stim_freq_hz,
-    channel_name="Signal"
+def find_pulses_on_dog_line(
+    dog_line,
+    third_derivative,
+    onset_percentile=70,
+    middle_percentile=98,
+    closing_percentile=70
 ):
     """
-    Plots a signal with D4 Extrema Gaps highlighted. Overlapping regions of these
-    gaps are shown in a different color.
+    Detects pulses on a pre-computed "Dog Line" using a 3-threshold state machine.
+    Thresholds are based on percentiles of the absolute third derivative values.
+
+    Args:
+        dog_line (np.ndarray): The pre-computed, non-negative dog line signal.
+        third_derivative (np.ndarray): The third derivative signal, used for thresholding.
+        onset_percentile (float): Percentile of abs(third_derivative) for the onset threshold.
+        middle_percentile (float): Percentile of abs(third_derivative) for the middle threshold.
+        closing_percentile (float): Percentile of abs(third_derivative) for the closing threshold.
+
+    Returns:
+        tuple: (pulse_starts, pulse_ends, thresholds)
     """
-    if signal_data_to_plot is None or len(signal_data_to_plot) == 0:
-        print("plot_signal_with_d4_gaps_and_overlaps: No signal data to plot.")
-        return
-    if estimated_stim_centers_samples is None or len(estimated_stim_centers_samples) == 0:
-        print("plot_signal_with_d4_gaps_and_overlaps: No estimated stim centers provided.")
-        return
-    if stim_freq_hz is None or stim_freq_hz <= 0:
-        print("plot_signal_with_d4_gaps_and_overlaps: Invalid stim_freq_hz.")
-        return
+    # 1. Define thresholds based on percentiles of the absolute third derivative
+    abs_third_deriv = np.abs(third_derivative)
+    onset_threshold = np.percentile(abs_third_deriv, onset_percentile)
+    middle_threshold = np.percentile(abs_third_deriv, middle_percentile)
+    closing_threshold = np.percentile(abs_third_deriv, closing_percentile)
 
-    # Calculate 4th derivative of the signal_data_to_plot
-    d1 = np.diff(signal_data_to_plot)
-    d2 = np.diff(d1) if len(d1) > 0 else np.array([])
-    d3 = np.diff(d2) if len(d2) > 0 else np.array([])
-    fourth_derivative_sig = np.diff(d3) if len(d3) > 0 else np.array([])
+    thresholds = {
+        'onset': onset_threshold,
+        'middle': middle_threshold,
+        'closing': closing_threshold
+    }
 
-    if len(fourth_derivative_sig) == 0:
-        print("plot_signal_with_d4_gaps_and_overlaps: Could not compute 4th derivative.")
-        return
+    # 2. State machine for pulse detection
+    state = "IDLE"  # States: IDLE, ARMED (onset crossed), CONFIRMED (middle crossed)
+    pulse_starts, pulse_ends = [], []
+    current_pulse_start = None
 
-    plt.figure(figsize=(18, 7))
-    plt.plot(times_array, signal_data_to_plot, label=f'{channel_name} Time Series', color='cornflowerblue', alpha=0.8)
+    for i, value in enumerate(dog_line):
+        if state == "IDLE":
+            if value > onset_threshold:
+                state = "ARMED"
+                current_pulse_start = i
+        elif state == "ARMED":
+            if value > middle_threshold:
+                state = "CONFIRMED"
+            elif value < closing_threshold:
+                state = "IDLE"
+                current_pulse_start = None
+        elif state == "CONFIRMED":
+            if value < closing_threshold:
+                pulse_starts.append(current_pulse_start)
+                pulse_ends.append(i)
+                state = "IDLE"
+                current_pulse_start = None
 
-    d4_gaps = [] # List to store (start_time, end_time) of each D4 gap
-    period_samples = sfreq / stim_freq_hz
-    half_period_search_samples = int(period_samples / 2.0)
+    if state == "CONFIRMED" and current_pulse_start is not None:
+        pulse_starts.append(current_pulse_start)
+        pulse_ends.append(len(dog_line) - 1)
 
-    for center_samp_abs_sig in estimated_stim_centers_samples:
-        time_of_d4_max_before = None
-        time_of_d4_min_after = None
+    return pulse_starts, pulse_ends, thresholds
 
-        # Window 1: Before center (for max D4)
-        s1_start_sig = max(0, center_samp_abs_sig - half_period_search_samples)
-        s1_end_sig = center_samp_abs_sig
-        d4_s1_start_idx = max(0, s1_start_sig - 4)
-        d4_s1_end_idx = max(0, s1_end_sig - 4)
-        if d4_s1_start_idx <= d4_s1_end_idx and d4_s1_end_idx < len(fourth_derivative_sig):
-            segment1_d4 = fourth_derivative_sig[d4_s1_start_idx : d4_s1_end_idx + 1]
-            if len(segment1_d4) > 0:
-                idx_max_local_d4 = np.argmax(segment1_d4)
-                abs_idx_d4_max_in_d4_array = d4_s1_start_idx + idx_max_local_d4
-                time_idx_for_plot_max = abs_idx_d4_max_in_d4_array + 4
-                if 0 <= time_idx_for_plot_max < len(times_array):
-                    time_of_d4_max_before = times_array[time_idx_for_plot_max]
-
-        # Window 2: After center (for min D4)
-        s2_start_sig = center_samp_abs_sig
-        s2_end_sig = min(len(signal_data_to_plot)-1, center_samp_abs_sig + half_period_search_samples)
-        d4_s2_start_idx = max(0, s2_start_sig - 4)
-        d4_s2_end_idx = max(0, s2_end_sig - 4)
-        if d4_s2_start_idx <= d4_s2_end_idx and d4_s2_end_idx < len(fourth_derivative_sig):
-            segment2_d4 = fourth_derivative_sig[d4_s2_start_idx : d4_s2_end_idx + 1]
-            if len(segment2_d4) > 0:
-                idx_min_local_d4 = np.argmin(segment2_d4)
-                abs_idx_d4_min_in_d4_array = d4_s2_start_idx + idx_min_local_d4
-                time_idx_for_plot_min = abs_idx_d4_min_in_d4_array + 4
-                if 0 <= time_idx_for_plot_min < len(times_array):
-                    time_of_d4_min_after = times_array[time_idx_for_plot_min]
-
-        if time_of_d4_max_before is not None and time_of_d4_min_after is not None and \
-           time_of_d4_max_before < time_of_d4_min_after:
-            d4_gaps.append((time_of_d4_max_before, time_of_d4_min_after))
-
-    # Plot individual D4 Gaps
-    first_d4_gap_plot = True
-    for start_t, end_t in d4_gaps:
-        label = "D4 Extrema Gap" if first_d4_gap_plot else "_nolegend_"
-        plt.axvspan(start_t, end_t, color='mediumseagreen', alpha=0.35, label=label)
-        if first_d4_gap_plot: first_d4_gap_plot = False
-
-    # Identify and plot overlapping regions
-    if len(d4_gaps) > 1:
-        events = []
-        for start_t, end_t in d4_gaps:
-            events.append((start_t, 1)) # 1 for start event
-            events.append((end_t, -1))  # -1 for end event
-        events.sort()
-
-        active_overlap_count = 0
-        last_time = events[0][0]
-        first_overlap_plot = True
-        for i in range(len(events)):
-            current_time, type = events[i]
-            if current_time > last_time and active_overlap_count >= 2:
-                label = "Overlapping D4 Gaps" if first_overlap_plot else "_nolegend_"
-                plt.axvspan(last_time, current_time, color='yellow', alpha=0.5, label=label)
-                if first_overlap_plot: first_overlap_plot = False
-            active_overlap_count += type
-            last_time = current_time
-
-    plt.xlabel('Time (s)')
-    plt.ylabel('Amplitude')
-    plt.title(f'Time Series of {channel_name} with D4 Extrema Gaps (Overlaps in Yellow)')
-    plt.legend(loc='upper right')
-    plt.grid(True, alpha=0.5)
-    plt.tight_layout()
-
-# --- New Plotting function for Signal with Interpolated D4 Gaps ---
-def plot_signal_with_interpolated_d4_gaps(
-    signal_data_to_plot,
-    times_array,
-    sfreq,
-    estimated_stim_centers_samples,
-    stim_freq_hz,
-    channel_name="Signal"
+def plot_dog_line_analysis(
+    raw_signal, times_raw, channel_name,
+    third_derivative, dog_line, peak_indices_on_deriv,
+    pulse_starts, pulse_ends, thresholds
 ):
+    """Plots the results of the dog line analysis."""
+    plt.figure(figsize=(18, 10))
+    gs = gridspec.GridSpec(2, 1, height_ratios=[1, 3])
+
+    # Top plot: Overview of the original signal for context
+    ax0 = plt.subplot(gs[0])
+    ax0.plot(times_raw, raw_signal, color='purple', alpha=0.7)
+    ax0.set_title(f'Original Signal: Channel {channel_name}')
+    ax0.set_ylabel('Amplitude')
+    ax0.grid(True, alpha=0.5)
+    ax0.set_xlim(times_raw.min(), times_raw.max())
+
+    # Bottom plot: Derivative, Dog Line, and Pulse Detection
+    ax1 = plt.subplot(gs[1])
+    x_axis_samples = np.arange(len(third_derivative))
+    ax1.plot(x_axis_samples, third_derivative, label='Third Derivative', alpha=0.5, color='gray')
+    ax1.plot(x_axis_samples, dog_line, label='Dog Line', linestyle='-', color='dodgerblue', linewidth=2.0)
+    # ax1.plot(peak_indices_on_deriv, third_derivative[peak_indices_on_deriv], 'x', color='black', markersize=5, label=f'Derivative Peaks ({len(peak_indices_on_deriv)})')
+
+    # Plot thresholds (positive only, since dog line is non-negative)
+    ax1.axhline(thresholds['onset'], color='green', linestyle=':', label=f'Onset Thresh ({thresholds["onset"]:.1e})')
+    ax1.axhline(thresholds['middle'], color='orange', linestyle=':', label=f'Middle Thresh ({thresholds["middle"]:.1e})')
+    ax1.axhline(thresholds['closing'], color='red', linestyle=':', label=f'Closing Thresh ({thresholds["closing"]:.1e})')
+
+    # Highlight detected pulses using axvspan
+    if pulse_starts:
+        ax1.axvspan(pulse_starts[0], pulse_ends[0], color='red', alpha=0.2, label=f'Detected Pulses ({len(pulse_starts)})')
+        for i in range(1, len(pulse_starts)):
+            ax1.axvspan(pulse_starts[i], pulse_ends[i], color='red', alpha=0.2)
+
+    ax1.set_title(f'Dog Line Pulse Detection for Channel {channel_name}')
+    ax1.set_xlabel('Sample Number (of derivative signal)')
+    ax1.set_ylabel('Amplitude (d³/dt³)')
+    ax1.legend(loc='upper right')
+    ax1.grid(True, alpha=0.5)
+    ax1.set_xlim(0, len(third_derivative))
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout
+
+def merge_close_pulses(starts, ends, min_separation_samples):
     """
-    Plots a signal, highlighting D4 Extrema Gaps and showing the signal
-    with cubic/linear spline interpolation applied within these gaps.
+    Merges detected pulses that are closer than a specified minimum separation.
+
+    Args:
+        starts (list or np.ndarray): List of pulse start indices.
+        ends (list or np.ndarray): List of pulse end indices.
+        min_separation_samples (int): The minimum number of samples between the end
+            of one pulse and the start of the next to keep them separate.
+
+    Returns:
+        tuple: (merged_starts, merged_ends)
     """
-    if signal_data_to_plot is None or len(signal_data_to_plot) == 0 or \
-       estimated_stim_centers_samples is None or len(estimated_stim_centers_samples) == 0 or \
-       stim_freq_hz is None or stim_freq_hz <= 0:
-        print("plot_signal_with_interpolated_d4_gaps: Insufficient data provided.")
-        return
+    if len(starts) < 2:
+        return starts, ends
 
-    # Calculate 4th derivative of the signal_data_to_plot
-    d1 = np.diff(signal_data_to_plot)
-    d2 = np.diff(d1) if len(d1) > 0 else np.array([])
-    d3 = np.diff(d2) if len(d2) > 0 else np.array([])
-    fourth_derivative_sig = np.diff(d3) if len(d3) > 0 else np.array([])
+    merged_starts = [starts[0]]
+    merged_ends = [ends[0]]
 
-    if len(fourth_derivative_sig) == 0:
-        print("plot_signal_with_interpolated_d4_gaps: Could not compute 4th derivative.")
-        return
+    for i in range(1, len(starts)):
+        gap = starts[i] - merged_ends[-1]
+        if gap < min_separation_samples:
+            merged_ends[-1] = ends[i] # Extend the previous pulse
+        else:
+            merged_starts.append(starts[i])
+            merged_ends.append(ends[i])
+    return merged_starts, merged_ends
 
-    signal_copy_interpolated = signal_data_to_plot.copy()
-    d4_gap_times_for_plot = [] # To store (start_time, end_time) for axvspan
+def remove_stim_artifacts_spline(raw_channel_data, pulse_starts_samples, pulse_ends_samples, sfreq, context_ms=10):
+    """
+    Removes stimulation artifacts from a channel's time series using spline interpolation.
 
-    period_samples = sfreq / stim_freq_hz
-    half_period_search_samples = int(period_samples / 2.0)
+    Args:
+        raw_channel_data (np.ndarray): The 1D raw data for a single channel.
+        pulse_starts_samples (list): List of start sample indices of detected pulses.
+        pulse_ends_samples (list): List of end sample indices of detected pulses.
+        sfreq (float): Sampling frequency of the data.
+        context_ms (float): Duration in milliseconds of "good" data to use before and after
+                            each artifact for interpolation context.
 
-    for center_samp_abs_sig in estimated_stim_centers_samples:
-        time_of_d4_max_before_s, time_of_d4_min_after_s = None, None
-        
-        # --- Find D4 max before center ---
-        s1_start_sig = max(0, center_samp_abs_sig - half_period_search_samples)
-        s1_end_sig = center_samp_abs_sig
-        d4_s1_start_idx = max(0, s1_start_sig - 4)
-        d4_s1_end_idx = max(0, s1_end_sig - 4)
-        if d4_s1_start_idx <= d4_s1_end_idx and d4_s1_end_idx < len(fourth_derivative_sig):
-            segment1_d4 = fourth_derivative_sig[d4_s1_start_idx : d4_s1_end_idx + 1]
-            if len(segment1_d4) > 0:
-                idx_max_local_d4 = np.argmax(segment1_d4)
-                abs_idx_d4_max_in_d4_array = d4_s1_start_idx + idx_max_local_d4
-                time_idx_for_plot_max = abs_idx_d4_max_in_d4_array + 4
-                if 0 <= time_idx_for_plot_max < len(times_array):
-                    time_of_d4_max_before_s = times_array[time_idx_for_plot_max]
+    Returns:
+        np.ndarray: The signal with artifacts interpolated.
+    """
+    interpolated_signal = np.copy(raw_channel_data)
+    n_samples = len(raw_channel_data)
+    context_samples = int(context_ms / 1000 * sfreq)
 
-        # --- Find D4 min after center ---
-        s2_start_sig = center_samp_abs_sig
-        s2_end_sig = min(len(signal_data_to_plot)-1, center_samp_abs_sig + half_period_search_samples)
-        d4_s2_start_idx = max(0, s2_start_sig - 4)
-        d4_s2_end_idx = max(0, s2_end_sig - 4)
-        if d4_s2_start_idx <= d4_s2_end_idx and d4_s2_end_idx < len(fourth_derivative_sig):
-            segment2_d4 = fourth_derivative_sig[d4_s2_start_idx : d4_s2_end_idx + 1]
-            if len(segment2_d4) > 0:
-                idx_min_local_d4 = np.argmin(segment2_d4)
-                abs_idx_d4_min_in_d4_array = d4_s2_start_idx + idx_min_local_d4
-                time_idx_for_plot_min = abs_idx_d4_min_in_d4_array + 4
-                if 0 <= time_idx_for_plot_min < len(times_array):
-                    time_of_d4_min_after_s = times_array[time_idx_for_plot_min]
-        
-        if time_of_d4_max_before_s is not None and time_of_d4_min_after_s is not None and \
-           time_of_d4_max_before_s < time_of_d4_min_after_s:
-            
-            gap_start_samp = int(time_of_d4_max_before_s * sfreq)
-            gap_end_samp = int(time_of_d4_min_after_s * sfreq)
-            d4_gap_times_for_plot.append((time_of_d4_max_before_s, time_of_d4_min_after_s))
+    print(f"\n--- Performing spline interpolation to remove artifacts ({context_ms}ms context) ---")
 
-            if gap_end_samp <= gap_start_samp: continue 
+    if not pulse_starts_samples:
+        print("No pulses detected, returning original signal.")
+        return interpolated_signal
 
-            # --- Interpolation for this gap ---
-            x_known_samples, y_known_values = [], []
-            num_pts_each_side = 2 # Number of points to try to get from each side of the gap
+    for i, (start, end) in enumerate(zip(pulse_starts_samples, pulse_ends_samples)):
+        # Define the region to be interpolated
+        interp_region_start = start
+        interp_region_end = end
 
-            for i in range(num_pts_each_side, 0, -1): # Points before: gap_start-2, gap_start-1
-                idx = gap_start_samp - i
-                if idx >= 0:
-                    x_known_samples.append(idx)
-                    y_known_values.append(signal_data_to_plot[idx])
-            
-            for i in range(1, num_pts_each_side + 1): # Points after: gap_end+1, gap_end+2
-                idx = gap_end_samp + i
-                if idx < len(signal_data_to_plot):
-                    x_known_samples.append(idx)
-                    y_known_values.append(signal_data_to_plot[idx])
-            
-            unique_x_indices = np.unique(x_known_samples, return_index=True)[1]
-            x_known_samples = np.array(x_known_samples)[unique_x_indices]
-            y_known_values = np.array(y_known_values)[unique_x_indices]
-            
-            # Sort by sample index
-            sort_order = np.argsort(x_known_samples)
-            x_known_samples = x_known_samples[sort_order]
-            y_known_values = y_known_values[sort_order]
+        # Define the context points for interpolation
+        # Points before the artifact
+        pre_context_indices = np.arange(max(0, interp_region_start - context_samples), interp_region_start)
+        # Points after the artifact
+        post_context_indices = np.arange(interp_region_end + 1, min(n_samples, interp_region_end + 1 + context_samples))
 
-            samples_to_interpolate = np.arange(gap_start_samp, gap_end_samp + 1)
-            if len(samples_to_interpolate) == 0: continue
+        x_known = np.concatenate((pre_context_indices, post_context_indices))
+        y_known = raw_channel_data[x_known]
 
-            interpolated_segment = None
+        # Determine interpolation kind based on number of known points
+        interp_kind = 'linear'
+        if len(x_known) >= 4: # Cubic requires at least 4 points
+            interp_kind = 'cubic'
+        elif len(x_known) >= 2: # Linear requires at least 2 points
             interp_kind = 'linear'
-            if len(x_known_samples) >= 4: interp_kind = 'cubic'
-            elif len(x_known_samples) < 2: 
-                print(f"Warning: Not enough points ({len(x_known_samples)}) for any interpolation at gap starting {time_of_d4_max_before_s:.3f}s. Skipping.")
-                continue
-            
-            try:
-                interp_func = scipy.interpolate.interp1d(x_known_samples, y_known_values, kind=interp_kind, bounds_error=False, fill_value=np.nan)
-                interpolated_segment = interp_func(samples_to_interpolate)
-                if np.isnan(interpolated_segment).any(): # Fallback if cubic produced NaNs (e.g. extrapolation)
-                    if interp_kind == 'cubic' and len(x_known_samples) >= 2: # Try linear if cubic failed
-                        interp_func_lin = scipy.interpolate.interp1d(x_known_samples, y_known_values, kind='linear', bounds_error=False, fill_value=np.nan)
-                        interpolated_segment = interp_func_lin(samples_to_interpolate)
-                
-                valid_interp_mask = ~np.isnan(interpolated_segment)
-                if np.any(valid_interp_mask):
-                     signal_copy_interpolated[samples_to_interpolate[valid_interp_mask]] = interpolated_segment[valid_interp_mask]
-                else:
-                    print(f"Warning: Interpolation resulted in all NaNs for gap at {time_of_d4_max_before_s:.3f}s.")
-            except ValueError as e:
-                print(f"Warning: Interpolation error for gap at {time_of_d4_max_before_s:.3f}s: {e}")
+        else:
+            print(f"Warning: Not enough context points ({len(x_known)}) for interpolation around artifact {i+1} (samples {start}-{end}). Skipping this artifact.")
+            continue # Skip this artifact if not enough context
 
-    # Plotting
-    plt.figure(figsize=(18, 7))
-    plt.plot(times_array, signal_data_to_plot, label=f'Original {channel_name}', color='gray', alpha=0.4, zorder=1)
-    plt.plot(times_array, signal_copy_interpolated, label=f'Interpolated {channel_name}', color='cornflowerblue', zorder=2)
+        # Create the interpolation function
+        try:
+            f_interp = scipy.interpolate.interp1d(x_known, y_known, kind=interp_kind, bounds_error=False, fill_value='extrapolate')
+        except ValueError as e:
+            print(f"Error creating interpolation function for artifact {i+1} (samples {start}-{end}): {e}. Skipping.")
+            continue
 
-    first_gap_span_plot = True
-    for start_t, end_t in d4_gap_times_for_plot:
-        label = "D4 Extrema Gap (Interpolated Region)" if first_gap_span_plot else "_nolegend_"
-        plt.axvspan(start_t, end_t, color='lightgreen', alpha=0.3, label=label, zorder=0)
-        if first_gap_span_plot: first_gap_span_plot = False
+        # Define the points within the artifact region to fill
+        x_to_fill = np.arange(interp_region_start, interp_region_end + 1)
+        
+        # Perform interpolation
+        interpolated_values = f_interp(x_to_fill)
+        
+        # Apply interpolated values to the signal copy
+        interpolated_signal[x_to_fill] = interpolated_values
     
+    print("Spline interpolation complete.")
+    return interpolated_signal
+
+def plot_artifact_removal(original_signal, interpolated_signal, times, normal_pulses, long_pulses, channel_name):
+    """Plots the original and interpolated signals, highlighting the removed artifact regions."""
+    plt.figure(figsize=(18, 8))
+    plt.plot(times, original_signal, label='Original Signal', color='blue', alpha=0.7)
+    plt.plot(times, interpolated_signal, label='Interpolated Signal', color='red', alpha=0.8, linestyle='--')
+
+    # Plot normal pulses in gray
+    if normal_pulses:
+        for i, (start, end) in enumerate(normal_pulses):
+            start_time = times[start]
+            end_time = times[end]
+            if i == 0:
+                plt.axvspan(start_time, end_time, color='gray', alpha=0.3, label=f'Interpolated Regions ({len(normal_pulses)})')
+            else:
+                plt.axvspan(start_time, end_time, color='gray', alpha=0.3)
+
+    # Plot the top 1% longest pulses in a different color for debugging
+    if long_pulses:
+        for i, (start, end) in enumerate(long_pulses):
+            start_time = times[start]
+            end_time = times[end]
+            if i == 0:
+                plt.axvspan(start_time, end_time, color='orange', alpha=0.4, label=f'Top 1% Longest Pulses ({len(long_pulses)})')
+            else:
+                plt.axvspan(start_time, end_time, color='orange', alpha=0.4)
+
+    plt.title(f'Stimulation Artifact Removal using Spline Interpolation (Channel: {channel_name})')
     plt.xlabel('Time (s)')
     plt.ylabel('Amplitude')
-    plt.title(f'Time Series of {channel_name} with D4 Gaps Interpolated')
-    plt.legend(loc='upper right')
+    plt.legend()
     plt.grid(True, alpha=0.5)
+    plt.xlim(times.min(), times.max())
     plt.tight_layout()
 
 # --- Main Execution Block (Corrected) ---
@@ -1463,138 +671,97 @@ if __name__ == '__main__':
                 strong_channel_name=ch_name_strong_for_plot,
                 estimated_stim_freq=final_est_stim_freq)
 
-        # Note: plot_signal_and_derivatives will be called later, after pulse detection
-        # 3. Determine and Visualize the Stimulation Epoch
-        epoch_start_s, epoch_end_s = None, None
-        if final_est_stim_freq is not None:
-            epoch_start_s, epoch_end_s = determine_stim_epoch_boundaries(
-                raw, final_est_stim_freq, threshold_factor=1.5
+        # --- New Analysis: Third Derivative and "Dog Line" ---
+        if strong_channel_idx_for_viz is not None:
+            print("\n--- Performing Dog Line Pulse Detection on Strongest Channel ---")
+            strong_channel_name = raw.ch_names[strong_channel_idx_for_viz]
+            strong_channel_data = data[strong_channel_idx_for_viz, :]
+
+            # Step 1: Create the dog line, finding all positive peaks
+            dog_line, third_deriv, deriv_peaks = create_dog_line(
+                channel_data=strong_channel_data,
+                peak_detection_height=0  # Find all positive peaks, no matter how small
             )
-            # You can uncomment the line below if you want to see the epoch visualization plot
-            # visualize_stim_epoch_with_sliding_window(
-            #     raw, final_est_stim_freq, strong_channel_idx=strong_channel_idx_for_viz
-            # )
-        else:
-            print("\nNo suitable stimulation frequency found to visualize epoch.")
 
-        # 4. Perform Pulse Identification using the FULLY AUTOMATIC function
-        if final_est_stim_freq:
-            # Determine the source signal for template creation
-            if strong_channel_idx_for_viz is not None:
-                source_signal_for_template_creation = data[strong_channel_idx_for_viz]
-                print(f"\nUsing data from strong channel ({raw.ch_names[strong_channel_idx_for_viz]}) for template creation.")
-            else:
-                source_signal_for_template_creation = avg_signal_full
-                print("\nNo strong channel identified or specified; using average signal for template creation.")
-
-            # Epoch the source signal if epoch boundaries are defined
-            if epoch_start_s is not None and epoch_end_s is not None:
-                signal_for_template = source_signal_for_template_creation[int(epoch_start_s*sampleRate):int(epoch_end_s*sampleRate)]
-                offset_samples = int(epoch_start_s*sampleRate)
-            else: # Use the full signal
-                signal_for_template = source_signal_for_template_creation
-                offset_samples = 0
-            
-            if len(signal_for_template) > 0:
-                # Call the final, automatic function.
-                pulse_starts_rel, pulse_ends_rel, template, mf_out, seed_peak_rel, detected_centers_rel = find_stimulation_pulses_auto(
-                    avg_signal_epoch=signal_for_template,
-                    sfreq=sampleRate,
-                    stim_freq_hz=final_est_stim_freq,
-                    debug_plots=USE_DEFAULT_TEST_PATHS # Automatically enable debug plots if using default paths
+            # Step 2: Find pulses on the dog line and plot results
+            if dog_line is not None:
+                # Find initial pulses based on new percentile thresholds
+                initial_pulse_starts, initial_pulse_ends, thresholds = find_pulses_on_dog_line(
+                    dog_line, third_deriv
                 )
 
-                # 5. Plot the Final Results
-                # Initialize plot variables to safe defaults
-                pulse_starts_abs, pulse_ends_abs = None, None # Add pulse_ends_abs back
-                current_template_for_plot = np.array([]) # Ensure it's an empty array, not None
-                seed_peak_abs_for_plot = None
-                detected_centers_abs_for_plot = None
+                print(f"Dog Line Thresholds (based on 3rd deriv percentiles):")
+                print(f"  Onset: {thresholds['onset']:.2e}, Middle: {thresholds['middle']:.2e}, Closing: {thresholds['closing']:.2e}")
 
-                if pulse_starts_rel is not None and len(pulse_starts_rel) > 0:
-                    pulse_starts_abs = np.array(pulse_starts_rel) + offset_samples
-                    pulse_ends_abs = np.array(pulse_ends_rel) + offset_samples
-                    if seed_peak_rel is not None: seed_peak_abs_for_plot = seed_peak_rel + offset_samples
-                    if detected_centers_rel is not None:
-                        detected_centers_abs_for_plot = detected_centers_rel + offset_samples
-
-
-                    signal_for_plot = data[strong_channel_idx_for_viz] if strong_channel_idx_for_viz is not None else avg_signal_full
-                    ch_name_for_plot = raw.ch_names[strong_channel_idx_for_viz] if strong_channel_idx_for_viz is not None else "Average"
-
-                    if template is not None and len(template) > 0:
-                        current_template_for_plot = np.asarray(template).squeeze()
-                        if current_template_for_plot.ndim == 0 or len(current_template_for_plot) == 0:
-                            print("Warning: Template is scalar or empty after squeeze. MF output will be zero for plotting.")
-                            current_template_for_plot = np.array([]) # Ensure it's an empty array for plotting func
-                        # else:
-                            # mf_full_for_plot and detected_pulse_centers_abs_for_plot were calculated here but are not used by the current plot
-                    else:
-                        print("Template not available or empty for plotting.")
-                        # current_template_for_plot is already an empty array
+                # Step 3: Merge close pulses
+                if initial_pulse_starts and final_est_stim_freq is not None and final_est_stim_freq > 0:
+                    min_dist_sec = 1.0 / (10 * final_est_stim_freq)
+                    min_dist_samples = int(min_dist_sec * sampleRate)
+                    print(f"Merging pulses closer than {min_dist_sec*1000:.1f} ms ({min_dist_samples} samples)...")
                     
-                    plot_template_and_overlaid_pulses(
-                        signal_to_plot=signal_for_plot,
-                        times_array=raw.times,
-                        pulse_starts_samples=pulse_starts_abs.astype(int) if pulse_starts_abs is not None else np.array([]),
-                        mean_signal_overall=avg_signal_full, # Pass the overall mean signal
-                        pulse_ends_samples=pulse_ends_abs.astype(int) if pulse_ends_abs is not None else np.array([]),
-                        template_waveform=current_template_for_plot,
-                        sfreq=sampleRate,
-                        channel_name=ch_name_for_plot,
-                        stim_freq_hz=final_est_stim_freq,
-                        seed_peak_abs_sample=seed_peak_abs_for_plot
+                    merged_starts, merged_ends = merge_close_pulses(
+                        initial_pulse_starts, initial_pulse_ends, min_dist_samples
                     )
-
-                    # Plot signal and derivatives for the selected signal (strong channel or average)
-                    if 'signal_for_plot' in locals() and 'raw' in locals() and hasattr(raw, 'times'):
-                        plot_signal_and_derivatives(
-                            signal_data=signal_for_plot,
-                            times_array=raw.times,
-                            signal_name=ch_name_for_plot,
-                            stim_freq_hz=final_est_stim_freq,
-                            pulse_starts_samples=pulse_starts_abs.astype(int) if pulse_starts_abs is not None else np.array([]),
-                            pulse_ends_samples=pulse_ends_abs.astype(int) if pulse_ends_abs is not None else np.array([]),
-                            sfreq=sampleRate
-                        )
+                    print(f"Found {len(initial_pulse_starts)} initial pulses, merged into {len(merged_starts)} final pulses.")
+                else:
+                    merged_starts, merged_ends = initial_pulse_starts, initial_pulse_ends
+                    if not initial_pulse_starts:
+                        print("No pulses met the threshold criteria on the dog line.")
                     else:
-                        print("Could not plot signal and derivatives due to missing data (signal_for_plot or raw.times).")
-                    
-                    # # Call the new plot for D4 gaps on the specific signal_for_plot
-                    # plot_signal_with_d4_gaps_and_overlaps(
-                    #     signal_data_to_plot=signal_for_plot,
-                    #     times_array=raw.times,
-                    #     sfreq=sampleRate,
-                    #     estimated_stim_centers_samples=detected_centers_abs_for_plot.astype(int) if detected_centers_abs_for_plot is not None else np.array([]),
-                    #     stim_freq_hz=final_est_stim_freq,
-                    #     channel_name=ch_name_for_plot
-                    # )
-                    
-                    # # Call the new plot for signal with interpolated D4 gaps
-                    # plot_signal_with_interpolated_d4_gaps(
-                    #     signal_data_to_plot=signal_for_plot,
-                    #     times_array=raw.times,
-                    #     sfreq=sampleRate,
-                    #     estimated_stim_centers_samples=detected_centers_abs_for_plot.astype(int) if detected_centers_abs_for_plot is not None else np.array([]),
-                    #     stim_freq_hz=final_est_stim_freq,
-                    #     channel_name=ch_name_for_plot
-                    # )
+                        print("Skipping pulse merging (no stim freq available).")
 
+                # Step 4: Perform spline interpolation to remove artifacts
+                interpolated_strong_channel_data = remove_stim_artifacts_spline(
+                    raw_channel_data=strong_channel_data,
+                    pulse_starts_samples=merged_starts,
+                    pulse_ends_samples=merged_ends,
+                    sfreq=sampleRate,
+                    context_ms=10 # 10ms context on each side
+                )
 
-                else: # No pulses identified (pulse_starts_rel is None or empty)
-                    print("No pulses identified by automatic function, or template generation failed. Skipping full results plot.")
-                    # You could optionally plot just the raw signal here if desired, e.g.:
-                    # plt.figure(figsize=(15,5))
-                    # plt.plot(raw.times, avg_signal_full)
-                    # plt.title("Average Signal (No Pulses Detected for Plotting)")
-                    # plt.show()
-            else: # if len(signal_for_template) == 0
-                print("Signal for template matching is empty, skipping pulse identification and plotting.")
-        else: # if not final_est_stim_freq
-            print("No stimulation frequency estimated, skipping pulse identification and plotting.")
+                # Step 5: Separate pulses by duration for plotting and then graph the results
+                normal_pulses = []
+                long_pulses = []
+                if merged_starts:
+                    pulse_durations = np.array(merged_ends) - np.array(merged_starts)
+                    # Define the threshold for the top 1% longest pulses
+                    duration_threshold = np.percentile(pulse_durations, 99)
+                    print(f"Highlighting pulses longer than the 99th percentile duration ({duration_threshold:.0f} samples).")
 
-        # Show all generated Matplotlib figures at the end
-        plt.show()
+                    for start, end, duration in zip(merged_starts, merged_ends, pulse_durations):
+                        if duration >= duration_threshold:
+                            long_pulses.append((start, end))
+                        else:
+                            normal_pulses.append((start, end))
+                else: # No pulses, so both lists are empty
+                    pass
+
+                plot_artifact_removal(
+                    original_signal=strong_channel_data,
+                    interpolated_signal=interpolated_strong_channel_data,
+                    times=raw.times,
+                    normal_pulses=normal_pulses,
+                    long_pulses=long_pulses,
+                    channel_name=strong_channel_name
+                )
+
+                plot_dog_line_analysis(
+                    raw_signal=strong_channel_data,
+                    times_raw=raw.times,
+                    channel_name=strong_channel_name,
+                    third_derivative=third_deriv,
+                    dog_line=dog_line,
+                    peak_indices_on_deriv=deriv_peaks,
+                    pulse_starts=merged_starts,
+                    pulse_ends=merged_ends,
+                    thresholds=thresholds
+                )
+            else:
+                print("Analysis skipped as dog line could not be created.")
+        else:
+            print("\nSkipping third derivative analysis because no strong channel was identified.")
+        
+        plt.show() # Display all generated figures
 
     except SystemExit:
         print("Program execution cancelled by user.")
