@@ -580,6 +580,57 @@ def plot_artifact_removal(original_signal, interpolated_signal, times, normal_pu
     plt.xlim(times.min(), times.max())
     plt.tight_layout()
 
+def plot_spectrogram_comparison(original_signal, cleaned_signal, sfreq, channel_name, stim_freq=None):
+    """Plots before and after spectrograms for artifact removal comparison."""
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 10), sharex=True, sharey=True)
+    fig.suptitle(f'Spectrogram Comparison for Artifact Removal (Channel: {channel_name})', fontsize=16)
+
+    # Calculate spectrogram for the original signal
+    f_orig, t_orig, Sxx_orig = signal.spectrogram(original_signal, fs=sfreq, nperseg=int(sfreq))
+    pcm1 = ax1.pcolormesh(t_orig, f_orig, 10 * np.log10(Sxx_orig + np.finfo(float).eps), shading='gouraud', cmap='viridis')
+    ax1.set_title('Before Artifact Removal')
+    ax1.set_ylabel('Frequency (Hz)')
+    if stim_freq:
+        ax1.axhline(stim_freq, color='red', linestyle='--', alpha=0.7, label=f'Stim Freq ({stim_freq:.1f} Hz)')
+    ax1.legend(loc='upper right')
+    fig.colorbar(pcm1, ax=ax1, label='Power/Frequency (dB/Hz)')
+
+    # Calculate spectrogram for the cleaned signal, using the same color scale for fair comparison
+    f_clean, t_clean, Sxx_clean = signal.spectrogram(cleaned_signal, fs=sfreq, nperseg=int(sfreq))
+    pcm2 = ax2.pcolormesh(t_clean, f_clean, 10 * np.log10(Sxx_clean + np.finfo(float).eps), shading='gouraud', cmap='viridis', vmin=pcm1.get_clim()[0], vmax=pcm1.get_clim()[1])
+    ax2.set_title('After Artifact Removal')
+    ax2.set_ylabel('Frequency (Hz)')
+    ax2.set_xlabel('Time (s)')
+    if stim_freq:
+        ax2.axhline(stim_freq, color='red', linestyle='--', alpha=0.7)
+    fig.colorbar(pcm2, ax=ax2, label='Power/Frequency (dB/Hz)')
+
+    plt.ylim(0, stim_freq * 2 if stim_freq and stim_freq > 0 else 150) # Focus on relevant frequencies
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+def plot_psd_comparison(original_signal, cleaned_signal, sfreq, channel_name, stim_freq=None):
+    """Plots before and after Power Spectral Densities (PSDs) for comparison."""
+    plt.figure(figsize=(12, 7))
+    
+    # Calculate PSDs using multitaper for consistency
+    psd_orig, freqs = psd_array_multitaper(original_signal[np.newaxis, :], sfreq=sfreq, fmin=0, fmax=sfreq/2, verbose=False)
+    psd_clean, _ = psd_array_multitaper(cleaned_signal[np.newaxis, :], sfreq=sfreq, fmin=0, fmax=sfreq/2, verbose=False)
+
+    # Plotting
+    plt.plot(freqs, 10 * np.log10(psd_orig[0]), label='Original PSD', color='blue', alpha=0.8)
+    plt.plot(freqs, 10 * np.log10(psd_clean[0]), label='Cleaned PSD (after interpolation)', color='red', alpha=0.8, linestyle='-')
+
+    if stim_freq:
+        plt.axvline(stim_freq, color='green', linestyle='--', alpha=0.7, label=f'Stim Freq ({stim_freq:.1f} Hz)')
+
+    plt.title(f'PSD Comparison Before and After Artifact Removal (Channel: {channel_name})')
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Power Spectral Density (dB/Hz)')
+    plt.legend()
+    plt.grid(True, which="both", ls="-", alpha=0.5)
+    plt.xlim(0, 150) # Limit to a reasonable frequency range for visualization
+    plt.tight_layout()
+
 # --- Main Execution Block (Corrected) ---
 if __name__ == '__main__':
     # Ensure Matplotlib backend is suitable for interactive plots if not running in a specific environment
@@ -735,6 +786,24 @@ if __name__ == '__main__':
                             normal_pulses.append((start, end))
                 else: # No pulses, so both lists are empty
                     pass
+
+                # --- Plotting for Verification ---
+                # Plot Spectrogram Comparison
+                plot_spectrogram_comparison(
+                    original_signal=strong_channel_data,
+                    cleaned_signal=interpolated_strong_channel_data,
+                    sfreq=sampleRate,
+                    channel_name=strong_channel_name,
+                    stim_freq=final_est_stim_freq
+                )
+                # Plot PSD Comparison
+                plot_psd_comparison(
+                    original_signal=strong_channel_data,
+                    cleaned_signal=interpolated_strong_channel_data,
+                    sfreq=sampleRate,
+                    channel_name=strong_channel_name,
+                    stim_freq=final_est_stim_freq
+                )
 
                 plot_artifact_removal(
                     original_signal=strong_channel_data,
