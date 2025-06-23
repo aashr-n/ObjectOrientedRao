@@ -131,6 +131,8 @@ def find_prominent_peaks(
     frequencies, 
     prominence=1, 
     distance=None, 
+    relative_prominence_threshold=5.0,
+    verbose=True,
     **kwargs):
     """
     Finds prominent peaks in a Power Spectral Density (PSD) plot.
@@ -146,6 +148,9 @@ def find_prominent_peaks(
             contour line that encircles it but no higher peak. Defaults to 1.
         distance (int, optional): The minimum required horizontal distance (in
             number of samples) between neighboring peaks. Defaults to None.
+        relative_prominence_threshold (float, optional): The threshold for a peak's
+            power relative to its local neighborhood. Defaults to 5.0.
+        verbose (bool, optional): If True, prints detailed output. Defaults to True.
         **kwargs: Other keyword arguments to be passed directly to
                   scipy.signal.find_peaks (e.g., 'height', 'width', 'threshold').
 
@@ -153,7 +158,8 @@ def find_prominent_peaks(
         float or None: The lowest frequency (in Hz) of a peak with relative
                        prominence > 5. Returns None if no such peak is found.
     """
-    print("Finding prominent peaks and calculating relative prominences...")
+    if verbose:
+        print("Finding prominent peaks and calculating relative prominences...")
     # Use scipy's find_peaks to locate the indices of the peaks
     # The 'prominence' parameter is key to finding peaks relative to their surroundings
     peak_indices, properties = find_peaks(
@@ -165,7 +171,8 @@ def find_prominent_peaks(
 
     # If no peaks are found, return an empty dictionary
     if len(peak_indices) == 0:
-        print("No initial peaks found by scipy.signal.find_peaks.")
+        if verbose:
+            print("No initial peaks found by scipy.signal.find_peaks.")
         return None
 
     # Extract the frequencies and PSD values at the peak indices
@@ -200,15 +207,15 @@ def find_prominent_peaks(
     relative_prominences_arr = np.array(relative_prominences_list)
 
     # Filter peaks with relative prominence > "5.0"
-    relativePromThreshold = 5.0  #################################################change if needed!!
-    strong_peak_mask = relative_prominences_arr > relativePromThreshold
+    strong_peak_mask = relative_prominences_arr > relative_prominence_threshold
 
     strong_peak_freqs = peak_frequencies[strong_peak_mask]
     strong_peak_psd_values = peak_psd_values[strong_peak_mask]
     strong_peak_std_proms = peak_prominences[strong_peak_mask]
     strong_peak_rel_proms = relative_prominences_arr[strong_peak_mask]
 
-    print(f"\n--- Peaks with Relative Prominence > {relativePromThreshold:.2f} ---")
+    if verbose:
+        print(f"\n--- Peaks with Relative Prominence > {relative_prominence_threshold:.2f} ---")
     if len(strong_peak_freqs) > 0:
         # Sort by frequency for consistent output and selection of lowest
         sort_indices = np.argsort(strong_peak_freqs)
@@ -217,15 +224,21 @@ def find_prominent_peaks(
         strong_peak_std_proms = strong_peak_std_proms[sort_indices]
         strong_peak_rel_proms = strong_peak_rel_proms[sort_indices]
 
-        for i in range(len(strong_peak_freqs)):
-            print(f"  Peak at {strong_peak_freqs[i]:.2f} Hz, PSD: {strong_peak_psd_values[i]:.2e}, "
-                  f"Std Prom: {strong_peak_std_proms[i]:.2f}, Rel Prom: {strong_peak_rel_proms[i]:.2f}")
+        if verbose:
+            # Only print if it's the main call, not the rapid-fire tracking call
+            if relative_prominence_threshold > 2.0:
+                # Loop through the found strong peaks to print their details
+                for i in range(len(strong_peak_freqs)):
+                    print(f"  Peak at {strong_peak_freqs[i]:.2f} Hz, PSD: {strong_peak_psd_values[i]:.2e}, "
+                          f"Std Prom: {strong_peak_std_proms[i]:.2f}, Rel Prom: {strong_peak_rel_proms[i]:.2f}")
         
         lowest_freq_strong_peak = strong_peak_freqs[0] # Already sorted by frequency
-        print(f"Returning lowest frequency with relative prominence > {relativePromThreshold:.2f}: {lowest_freq_strong_peak:.2f} Hz")
+        if verbose:
+            print(f"Returning lowest frequency with relative prominence > {relative_prominence_threshold:.2f}: {lowest_freq_strong_peak:.2f} Hz")
         return lowest_freq_strong_peak
     else:
-        print(f"No peaks found with relative prominence > {relativePromThreshold:.2f}.")
+        if verbose:
+            print(f"No peaks found with relative prominence > {relative_prominence_threshold:.2f}.")
         return None
 
 # Helper function to calculate relative prominence for a single peak
@@ -631,6 +644,106 @@ def plot_psd_comparison(original_signal, cleaned_signal, sfreq, channel_name, st
     plt.xlim(0, 150) # Limit to a reasonable frequency range for visualization
     plt.tight_layout()
 
+def calculate_frequency_over_time(all_channels_data, sfreq, window_sec=2.0, step_sec=0.5):
+    """
+    Calculates the dominant stimulation frequency in a signal over time using a sliding window.
+    This version uses the full multi-step refinement process within each window.
+
+    Args:
+        all_channels_data (np.ndarray): The 2D raw data for ALL channels (n_channels, n_samples).
+        sfreq (float): Sampling frequency.
+        window_sec (float): Duration of the sliding window in seconds.
+        step_sec (float): Step size for the sliding window in seconds.
+
+    Returns:
+        tuple: (window_times, frequencies_over_time) where frequencies_over_time
+               may contain np.nan for windows where no peak was found.
+    """
+    window_samples = int(window_sec * sfreq)
+    step_samples = int(step_sec * sfreq)
+    n_channels, n_samples = all_channels_data.shape
+
+    window_starts = np.arange(0, n_samples - window_samples + 1, step_samples)
+    window_times = (window_starts + window_samples / 2) / sfreq # Center of window
+
+    frequencies_over_time = []
+    
+    print(f"\nAnalyzing frequency over time with a {window_sec}s window, stepping every {step_sec}s (using full refinement)...")
+    for i, start in enumerate(window_starts):
+        print(f"\rProcessing window {i+1}/{len(window_starts)}...", end='', flush=True)
+        end = start + window_samples
+        window_data = all_channels_data[:, start:end]
+
+        # 1. Calculate PSD for all channels in this window
+        psds_win, freqs_win = psd_array_multitaper(
+            window_data, 
+            sfreq=sfreq, 
+            fmin=1, 
+            fmax=sfreq/2, 
+            verbose=False
+        )
+
+        # 2. Get initial estimate from mean PSD of the window
+        mean_psd_win = np.mean(psds_win, axis=0)
+        est_freq_win = find_prominent_peaks(
+            psd_values=mean_psd_win,
+            frequencies=freqs_win,
+            prominence=0.1,
+            distance=20,
+            relative_prominence_threshold=2.0, # Lenient for tracking
+            verbose=False # Suppress printing for this call
+        )
+
+        final_freq_for_window = np.nan # Default to NaN
+
+        # 3. Refine using the strongest channel in the window
+        if est_freq_win is not None and est_freq_win > 0:
+            band_total_width = 1.0 / (est_freq_win * 10.0)
+            band_half_width = band_total_width / 2.0
+            lower_b = max(est_freq_win - band_half_width, freqs_win.min())
+            upper_b = min(est_freq_win + band_half_width, freqs_win.max())
+
+            if upper_b > lower_b:
+                freq_mask = (freqs_win >= lower_b) & (freqs_win <= upper_b)
+                if np.any(freq_mask):
+                    channel_band_powers = np.sum(psds_win[:, freq_mask], axis=1)
+                    strong_channel_idx_win = np.argmax(channel_band_powers)
+                    
+                    refined_freq = find_prominent_peaks(
+                        psd_values=psds_win[strong_channel_idx_win, :], frequencies=freqs_win,
+                        prominence=0.1, distance=20, relative_prominence_threshold=2.0, verbose=False
+                    )
+                    final_freq_for_window = refined_freq if refined_freq is not None else est_freq_win
+                else:
+                    final_freq_for_window = est_freq_win # Fallback if band is empty
+            else:
+                final_freq_for_window = est_freq_win # Fallback if band is invalid
+        
+        frequencies_over_time.append(final_freq_for_window)
+    
+    print("\nFrequency tracking complete.")
+    return window_times, np.array(frequencies_over_time)
+
+def plot_frequency_over_time(times, frequencies, channel_name, mean_freq=None):
+    """Plots the estimated stimulation frequency over time."""
+    plt.figure(figsize=(18, 6))
+    plt.plot(times, frequencies, marker='.', linestyle='-', label='Frequency per Window')
+    
+    if mean_freq is not None:
+        plt.axhline(mean_freq, color='red', linestyle='--', label=f'Overall Estimated Freq: {mean_freq:.2f} Hz')
+    
+    valid_freqs = frequencies[~np.isnan(frequencies)]
+    if len(valid_freqs) > 0:
+        y_min, y_max = np.min(valid_freqs) - 5, np.max(valid_freqs) + 5
+        plt.ylim(max(0, y_min), y_max)
+
+    plt.title(f'Stimulation Frequency Over Time (Channel: {channel_name})')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Estimated Frequency (Hz)')
+    plt.legend()
+    plt.grid(True, alpha=0.5)
+    plt.tight_layout()
+
 # --- Main Execution Block (Corrected) ---
 if __name__ == '__main__':
     # Ensure Matplotlib backend is suitable for interactive plots if not running in a specific environment
@@ -721,6 +834,24 @@ if __name__ == '__main__':
                 strong_channel_psd_array=psd_strong_ch_for_plot,
                 strong_channel_name=ch_name_strong_for_plot,
                 estimated_stim_freq=final_est_stim_freq)
+
+        # --- New Analysis: Frequency over Time ---
+        if strong_channel_idx_for_viz is not None and final_est_stim_freq is not None:
+            print("\n--- Calculating Stimulation Frequency Over Time ---")
+            
+            # Call new function to calculate frequency over time
+            window_times, freqs_over_time = calculate_frequency_over_time(
+                all_channels_data=data, # Pass all channel data
+                sfreq=sampleRate,
+            )
+            
+            # Call new function to plot the results
+            plot_frequency_over_time(
+                times=window_times,
+                frequencies=freqs_over_time,
+                channel_name=raw.ch_names[strong_channel_idx_for_viz],
+                mean_freq=final_est_stim_freq
+            )
 
         # --- New Analysis: Third Derivative and "Dog Line" ---
         if strong_channel_idx_for_viz is not None:
